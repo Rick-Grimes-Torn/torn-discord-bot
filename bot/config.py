@@ -18,6 +18,36 @@ LEADERSHIP_ROLES = {"Negan Saviors", "Lieutenant Saviors", "Soldier"}
 WAR_START_CACHE_TTL_SECONDS = 120
 USER_STATS_CACHE_TTL_SECONDS = 60
 
+# Ordered list (first one that’s available wins)
+EASY_TARGET_ATTACK_LINKS: list[str] = [
+    "https://www.torn.com/loader.php?sid=attack&user2ID=1690708",
+    "https://www.torn.com/loader.php?sid=attack&user2ID=3517372",
+    "https://www.torn.com/loader.php?sid=attack&user2ID=3677182",
+    "https://www.torn.com/loader.php?sid=attack&user2ID=1976263",
+    "https://www.torn.com/loader.php?sid=attack&user2ID=3121813",
+    "https://www.torn.com/loader.php?sid=attack&user2ID=2074734",
+    "https://www.torn.com/loader.php?sid=attack&user2ID=3203692",
+    "https://www.torn.com/loader.php?sid=attack&user2ID=3204742",
+    "https://www.torn.com/loader.php?sid=attack&user2ID=2035042",
+    "https://www.torn.com/loader.php?sid=attack&user2ID=1669605",
+    "https://www.torn.com/loader.php?sid=attack&user2ID=1683984",
+    "https://www.torn.com/loader.php?sid=attack&user2ID=3125220",
+    "https://www.torn.com/loader.php?sid=attack&user2ID=3675495",
+    "https://www.torn.com/loader.php?sid=attack&user2ID=3518771",
+    "https://www.torn.com/loader.php?sid=attack&user2ID=2359838",
+    "https://www.torn.com/loader.php?sid=attack&user2ID=3494378",
+    "https://www.torn.com/loader.php?sid=attack&user2ID=2661850",
+    "https://www.torn.com/loader.php?sid=attack&user2ID=3335007",
+    "https://www.torn.com/loader.php?sid=attack&user2ID=2986400",
+    "https://www.torn.com/loader.php?sid=attack&user2ID=3179561",
+
+]
+
+# Which Torn "status.state" values should be considered NOT attackable
+# (You asked “out of hospital”; I’m including Jail/Federal as sensible defaults.
+# If you want ONLY hospital, remove the others.)
+DISALLOWED_TARGET_STATES = {"Hospital", "Jail", "Federal"}
+
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN missing in .env")
 if not TORN_API_KEY:

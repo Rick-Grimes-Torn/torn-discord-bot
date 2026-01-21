@@ -61,6 +61,28 @@ async def torn_get(path: str, params: Optional[dict] = None, timeout: Optional[f
         raise RuntimeError("Unexpected Torn API response (not a JSON object).")
     return data
 
+# -----------------------------
+# USER STATUS (NEW)
+# -----------------------------
+
+async def fetch_user_status(user_id: int) -> Dict[str, Any]:
+    """
+    Fetches user profile (v2) and returns normalized status dict.
+
+    Uses v2 query-param ID form:
+      GET /v2/user?id=<id>&selections=profile
+    This is generally safer than relying on path IDs for selections that may fallback. :contentReference[oaicite:2]{index=2}
+    """
+    params = {"id": str(int(user_id)), "selections": "profile"}
+    data = await torn_get("/user", params=params)
+
+    # Defensive: Torn typing / structure can vary
+    status = data.get("status")
+    if isinstance(status, dict):
+        return status
+
+    # Sometimes the payload might be nested or missing; treat as unavailable
+    return {}
 
 async def fetch_faction_members() -> List[dict]:
     data = await torn_get("/faction/members")
