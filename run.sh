@@ -20,7 +20,7 @@ while true; do
 
   # Run bot; capture exit code without killing the script on failure
   set +e
-  python -m bot.main 2>&1 | tee -a "$LOG_FILE"
+  micromamba run -n tornbot python -m bot.main 2>&1 | tee -a "$LOG_FILE"
   EXIT_CODE=${PIPESTATUS[0]}
   set -e
 
