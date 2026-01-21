@@ -4,16 +4,24 @@ from discord import app_commands
 
 
 QUOTES = [
-    "I hope you brought your bravest face… because this is gonna sting a little.",
-    "Congratulations. You just won today’s award for ‘bold choices.’",
-    "I’m not saying that was a bad idea… but it’s definitely in the running.",
-    "If confidence was damage, you’d be a boss fight.",
-    "Today’s vibe: chaotic good… with a side of trouble.",
-    "You’re doing great. Terrifyingly great.",
-    "I’ve seen cleaner work from a squirrel with a clipboard.",
-    "That plan has *spirit*. Not accuracy — but spirit.",
-    "You’re about to learn the ancient art of: ‘maybe don’t do that.’",
-    "Okay, okay… I respect the commitment to nonsense.",
+    "Hi. You're Rick, right? I'm Negan. And I do not appreciate you killing my men.",
+    "I'm gonna kill you. That's what I'm gonna do. I'm gonna kill you, and then I'm gonna kill your friends, and I'm gonna kill everyone you've ever met!",
+    "Eeny, meeny, miny, moe.",
+    "You're not the shit, Rick. You're the shit-stain on the shit-stained sheets of shit.",
+    "Suck my balls.",
+    "I'm Negan.",
+    "I Thought We Were Having A Moment, You Little Asshole!",
+    "Lucille Is Thirsty... She Is A Vampire Bat!",
+    "Welcome To A Brand New Beginning, You Sorry Shits!",
+    "I Wear A Leather Jacket, I Have Lucille, And My Nut Sack Is Made Of Steel.",
+    "I've Got My Fingers Crossed For A Little Freaky Deaky!",
+    “Pissing Our Pants Yet? It’s Gonna' Be Pee-Pee Pants City Here Real Soon!”,
+    "Is That You, Rick? Under All That Man-Bush?",
+    “I Am About 50% Percent More Into You Now... Just Sayin'!”,
+    "I'm A God Damn Cat!",
+    "You Are Adorable! Did You Pick That Gun Because It Looks Cool? You Totally Did!",
+    "I Could Never Do This With Rick. He Would Just Be Standing There, Scowling, Giving Me That Annoying Side-Eye He Gives Me.”
+
 ]
 
 
