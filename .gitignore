@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env / micromamba
+.venv/
+micromamba/
+env/
+conda/
+
+# Environment secrets
+.env
+
+# SQLite
+*.sqlite3
+*.db
+
+# Logs
+logs/
+*.log
+
+# OS junk
+.DS_Store
