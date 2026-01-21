@@ -1,3 +1,4 @@
+# bot/torn_api.py
 import time
 import asyncio
 from typing import Optional, List, Tuple, Dict, Any
@@ -14,12 +15,20 @@ from .config import (
 from .utils import extract_to_from_prev_url
 
 
+# -------------------------------------------------------------------
+# Internal caches
+# -------------------------------------------------------------------
+
 _war_start_cache: Dict[str, Any] = {"ts": None, "fetched_at": 0}
 _user_stats_cache: Dict[int, Dict[str, Any]] = {}
 _inflight_user_scans: Dict[int, asyncio.Task] = {}
 _war_window_stats_cache: Dict[int, Dict[str, Any]] = {}
 _inflight_war_window_scans: Dict[int, asyncio.Task] = {}
 
+
+# -------------------------------------------------------------------
+# Core HTTP helper
+# -------------------------------------------------------------------
 
 def _raise_torn_error(data) -> None:
     if not isinstance(data, dict) or "error" not in data:
@@ -33,7 +42,10 @@ def _raise_torn_error(data) -> None:
 
 
 async def torn_get(path: str, params: Optional[dict] = None, timeout: Optional[float] = None) -> dict:
-    headers = {"Authorization": f"ApiKey {TORN_API_KEY}", "User-Agent": "discord-torn-bot"}
+    headers = {
+        "Authorization": f"ApiKey {TORN_API_KEY}",
+        "User-Agent": "discord-torn-bot",
+    }
 
     if timeout is None:
         timeout = TORN_TIMEOUT_SECONDS
@@ -45,14 +57,11 @@ async def torn_get(path: str, params: Optional[dict] = None, timeout: Optional[f
 
     timeout_obj = aiohttp.ClientTimeout(total=timeout_seconds)
 
-    # NOTE: This creates a new session each call.
-    # It works, but for polling you may later want a shared session in main.py.
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=timeout_obj) as session:
         async with session.get(
             f"{TORN_BASE}{path}",
             headers=headers,
             params=params,
-            timeout=timeout_obj,
         ) as resp:
             data = await resp.json(content_type=None)
 
@@ -61,29 +70,17 @@ async def torn_get(path: str, params: Optional[dict] = None, timeout: Optional[f
         raise RuntimeError("Unexpected Torn API response (not a JSON object).")
     return data
 
-# -----------------------------
-# USER STATUS (NEW)
-# -----------------------------
 
-async def fetch_user_status(user_id: int) -> Dict[str, Any]:
-    """
-    Fetch the user's status using v2.
-    """
-    params = {"id": str(int(user_id)), "selections": "basic"}
-    data = await torn_get("/user", params=params)
+# -------------------------------------------------------------------
+# Faction endpoints
+# -------------------------------------------------------------------
 
-    # v2 may return status at top-level, or under "basic" depending on endpoint behavior
-    status = data.get("status")
-    if isinstance(status, dict):
-        return status
-
-    basic = data.get("basic")
-    if isinstance(basic, dict):
-        s2 = basic.get("status")
-        if isinstance(s2, dict):
-            return s2
-
-    return {}
+async def fetch_faction_members() -> List[dict]:
+    data = await torn_get("/faction/members")
+    members = data.get("members", [])
+    if not isinstance(members, list):
+        raise RuntimeError("Unexpected Torn API response: 'members' is not a list")
+    return members
 
 
 async def fetch_faction_balance() -> dict:
@@ -101,12 +98,14 @@ async def fetch_faction_attacks_outgoing(limit: int = 100, to: Optional[int] = N
     return await torn_get("/faction/attacks", params=params)
 
 
+# -------------------------------------------------------------------
+# Ranked war helpers
+# -------------------------------------------------------------------
+
 def get_latest_ranked_war_start(wars_payload: dict) -> Optional[int]:
     wars = wars_payload.get("wars") or {}
     ranked = wars.get("ranked") or {}
     start = ranked.get("start")
-    if isinstance(start, int) and start > 0:
-        return start
     try:
         s = int(start)
         return s if s > 0 else None
@@ -115,10 +114,6 @@ def get_latest_ranked_war_start(wars_payload: dict) -> Optional[int]:
 
 
 async def get_cached_ranked_war_start() -> int:
-    """
-    Cache ranked war start timestamp for WAR_START_CACHE_TTL_SECONDS.
-    Clears per-user stats cache if a new war start is detected.
-    """
     now = int(time.time())
 
     cached_ts = _war_start_cache.get("ts")
@@ -130,7 +125,7 @@ async def get_cached_ranked_war_start() -> int:
     wars = await fetch_faction_wars()
     war_start = get_latest_ranked_war_start(wars)
     if not war_start:
-        raise RuntimeError("Could not find latest ranked war start timestamp from /faction/wars.")
+        raise RuntimeError("Could not find latest ranked war start timestamp.")
 
     if cached_ts is not None and int(cached_ts) != int(war_start):
         _user_stats_cache.clear()
@@ -140,6 +135,10 @@ async def get_cached_ranked_war_start() -> int:
     _war_start_cache["fetched_at"] = now
     return int(war_start)
 
+
+# -------------------------------------------------------------------
+# Ranked war stats (per user)
+# -------------------------------------------------------------------
 
 async def _compute_ranked_war_stats_for_user(torn_user_id: int) -> Tuple[int, float, int, int]:
     war_start = await get_cached_ranked_war_start()
@@ -174,9 +173,8 @@ async def _compute_ranked_war_stats_for_user(torn_user_id: int) -> Tuple[int, fl
                 continue
 
             attacker = a.get("attacker") or {}
-            attacker_id = attacker.get("id")
             try:
-                attacker_id = int(attacker_id)
+                attacker_id = int(attacker.get("id"))
             except Exception:
                 continue
 
@@ -191,34 +189,36 @@ async def _compute_ranked_war_stats_for_user(torn_user_id: int) -> Tuple[int, fl
                 if ff is not None:
                     ff_sum += float(ff)
                     ff_count += 1
-            except (TypeError, ValueError):
+            except Exception:
                 pass
 
         if stop:
             break
 
         prev_url = (((page.get("_metadata") or {}).get("links") or {}).get("prev"))
-        next_to = extract_to_from_prev_url(prev_url)
-        if next_to is None:
+        to_val = extract_to_from_prev_url(prev_url)
+        if to_val is None:
             break
-        to_val = next_to
 
     return total_attacks, ff_sum, ff_count, war_start
 
 
 async def scan_ranked_war_stats_for_user(torn_user_id: int) -> Tuple[int, float, int, int]:
-    """
-    Cached wrapper:
-    - per-user TTL cache
-    - dedupe concurrent scans per user
-    """
     now = int(time.time())
     war_start = await get_cached_ranked_war_start()
 
     cached = _user_stats_cache.get(int(torn_user_id))
     if cached:
-        if int(cached.get("war_start")) == int(war_start) and (now - int(cached.get("computed_at", 0))) <= USER_STATS_CACHE_TTL_SECONDS:
-            return int(cached["attacks"]), float(cached["ff_sum"]), int(cached["ff_count"]), int(war_start)
+        if (
+            int(cached.get("war_start")) == int(war_start)
+            and (now - int(cached.get("computed_at", 0))) <= USER_STATS_CACHE_TTL_SECONDS
+        ):
+            return (
+                int(cached["attacks"]),
+                float(cached["ff_sum"]),
+                int(cached["ff_count"]),
+                int(war_start),
+            )
 
     inflight = _inflight_user_scans.get(int(torn_user_id))
     if inflight and not inflight.done():
@@ -243,29 +243,22 @@ async def scan_ranked_war_stats_for_user(torn_user_id: int) -> Tuple[int, float,
     _inflight_user_scans[int(torn_user_id)] = task
     return await task
 
+
+# -------------------------------------------------------------------
+# War window stats (per user)
+# -------------------------------------------------------------------
+
 async def _compute_war_window_stats_for_user(torn_user_id: int) -> Tuple[int, int, int, float, int, int]:
-    """
-    War window = [war_start, now], where war_start is from /faction/wars ranked.start
-
-    Returns:
-      total_attacks, in_war_attacks, out_of_war_attacks, ff_sum_all, ff_count_all, war_start
-
-    Notes:
-    - Counts ALL outgoing attacks by the user in the window
-    - "in_war" is based on is_ranked_war == True (same as your ranked-war logic)
-    - FF is averaged across ALL counted attacks where modifiers.fair_fight is readable
-    """
     war_start = await get_cached_ranked_war_start()
 
     total_attacks = 0
     in_war_attacks = 0
     out_of_war_attacks = 0
-
     ff_sum = 0.0
     ff_count = 0
 
     to_val: Optional[int] = None
-    max_pages = 60  # keep consistent with existing scan
+    max_pages = 60
 
     for _ in range(max_pages):
         page = await fetch_faction_attacks_outgoing(limit=100, to=to_val)
@@ -287,60 +280,58 @@ async def _compute_war_window_stats_for_user(torn_user_id: int) -> Tuple[int, in
                 break
 
             attacker = a.get("attacker") or {}
-            attacker_id = attacker.get("id")
             try:
-                attacker_id = int(attacker_id)
+                attacker_id = int(attacker.get("id"))
             except Exception:
                 continue
 
             if attacker_id != int(torn_user_id):
                 continue
 
-            # Count ALL attacks in the war window
             total_attacks += 1
 
-            # Split in-war vs outside-war (using the same flag your ranked logic trusts)
-            if a.get("is_ranked_war", False) is True:
+            if a.get("is_ranked_war", False):
                 in_war_attacks += 1
             else:
                 out_of_war_attacks += 1
 
-            # FF across ALL attacks with readable fair_fight
             modifiers = a.get("modifiers") or {}
             ff = modifiers.get("fair_fight")
             try:
                 if ff is not None:
                     ff_sum += float(ff)
                     ff_count += 1
-            except (TypeError, ValueError):
+            except Exception:
                 pass
 
         if stop:
             break
 
         prev_url = (((page.get("_metadata") or {}).get("links") or {}).get("prev"))
-        next_to = extract_to_from_prev_url(prev_url)
-        if next_to is None:
+        to_val = extract_to_from_prev_url(prev_url)
+        if to_val is None:
             break
-        to_val = next_to
 
-    return total_attacks, in_war_attacks, out_of_war_attacks, ff_sum, ff_count, war_start
+    return (
+        total_attacks,
+        in_war_attacks,
+        out_of_war_attacks,
+        ff_sum,
+        ff_count,
+        war_start,
+    )
 
 
 async def scan_war_window_stats_for_user(torn_user_id: int) -> Tuple[int, int, int, float, int, int]:
-    """
-    Cached wrapper (mirrors scan_ranked_war_stats_for_user):
-    - per-user TTL cache
-    - dedupe concurrent scans per user
-    - invalidated automatically when war_start changes (via get_cached_ranked_war_start clearing ranked cache;
-      we also validate war_start in this cache key)
-    """
     now = int(time.time())
     war_start = await get_cached_ranked_war_start()
 
     cached = _war_window_stats_cache.get(int(torn_user_id))
     if cached:
-        if int(cached.get("war_start")) == int(war_start) and (now - int(cached.get("computed_at", 0))) <= USER_STATS_CACHE_TTL_SECONDS:
+        if (
+            int(cached.get("war_start")) == int(war_start)
+            and (now - int(cached.get("computed_at", 0))) <= USER_STATS_CACHE_TTL_SECONDS
+        ):
             return (
                 int(cached["total"]),
                 int(cached["in_war"]),
@@ -376,31 +367,23 @@ async def scan_war_window_stats_for_user(torn_user_id: int) -> Tuple[int, int, i
     return await task
 
 
-# -----------------------------
-# CHAIN (NEW)
-# -----------------------------
+# -------------------------------------------------------------------
+# Chain (v2)
+# -------------------------------------------------------------------
 
 def _safe_int(v, default: Optional[int] = None) -> Optional[int]:
     try:
-        i = int(v)
-        return i
+        return int(v)
     except Exception:
         return default
 
 
 async def fetch_faction_chain() -> Dict[str, Any]:
-    """
-    Fetch chain status (v2). Uses Authorization header via torn_get().
-    """
     data = await torn_get("/faction/chain")
     return data if isinstance(data, dict) else {}
 
 
 def parse_active_chain(payload: dict) -> Optional[dict]:
-    """
-    Returns normalized chain dict if active, else None.
-    Normalizes Torn's inconsistent typing (strings vs ints).
-    """
     if not isinstance(payload, dict):
         return None
 
@@ -424,7 +407,6 @@ def parse_active_chain(payload: dict) -> Optional[dict]:
         if vi is not None:
             out[k] = int(vi)
 
-    # modifier can be float/int/string
     try:
         if chain.get("modifier") is not None:
             out["modifier"] = float(chain.get("modifier"))
@@ -432,3 +414,27 @@ def parse_active_chain(payload: dict) -> Optional[dict]:
         pass
 
     return out
+
+
+# -------------------------------------------------------------------
+# USER STATUS (NEW)
+# -------------------------------------------------------------------
+
+async def fetch_user_status(user_id: int) -> Dict[str, Any]:
+    """
+    Fetch user status via v2. Returns status dict or {}.
+    """
+    params = {"id": str(int(user_id)), "selections": "basic"}
+    data = await torn_get("/user", params=params)
+
+    status = data.get("status")
+    if isinstance(status, dict):
+        return status
+
+    basic = data.get("basic")
+    if isinstance(basic, dict):
+        s2 = basic.get("status")
+        if isinstance(s2, dict):
+            return s2
+
+    return {}
