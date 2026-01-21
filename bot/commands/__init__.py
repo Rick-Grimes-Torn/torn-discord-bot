@@ -14,6 +14,8 @@ from . import status_cmd
 from . import market
 from . import war
 from . import chain
+from . import neganquote
+
 
 
 
@@ -58,6 +60,8 @@ def register_all(client, tree):
     _call_register(market, client, tree)
     _call_register(war, client, tree)
     _call_register(chain, client, tree)
+    _call_register(neganquote, client, tree)
+
 
 
 
