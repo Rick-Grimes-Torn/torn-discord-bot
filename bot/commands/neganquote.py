@@ -15,9 +15,9 @@ QUOTES = [
     "Welcome To A Brand New Beginning, You Sorry Shits!",
     "I Wear A Leather Jacket, I Have Lucille, And My Nut Sack Is Made Of Steel.",
     "I've Got My Fingers Crossed For A Little Freaky Deaky!",
-    “Pissing Our Pants Yet? It’s Gonna' Be Pee-Pee Pants City Here Real Soon!”,
+    "Pissing Our Pants Yet? It’s Gonna' Be Pee-Pee Pants City Here Real Soon!",
     "Is That You, Rick? Under All That Man-Bush?",
-    “I Am About 50% Percent More Into You Now... Just Sayin'!”,
+    "I Am About 50% Percent More Into You Now... Just Sayin'!",
     "I'm A God Damn Cat!",
     "You Are Adorable! Did You Pick That Gun Because It Looks Cool? You Totally Did!",
     "I Could Never Do This With Rick. He Would Just Be Standing There, Scowling, Giving Me That Annoying Side-Eye He Gives Me.”
