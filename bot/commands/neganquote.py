@@ -20,7 +20,7 @@ QUOTES = [
     "I Am About 50% Percent More Into You Now... Just Sayin'!",
     "I'm A God Damn Cat!",
     "You Are Adorable! Did You Pick That Gun Because It Looks Cool? You Totally Did!",
-    "I Could Never Do This With Rick. He Would Just Be Standing There, Scowling, Giving Me That Annoying Side-Eye He Gives Me.”
+    "I Could Never Do This With Rick. He Would Just Be Standing There, Scowling, Giving Me That Annoying Side-Eye He Gives Me.”,
 
 ]
 
@@ -29,4 +29,4 @@ def register(tree: app_commands.CommandTree):
     @tree.command(name="neganquote", description="Get a random Negan-ish quote.")
     async def neganquote(interaction: discord.Interaction):
         quote = random.choice(QUOTES)
-        await interaction.response.send_message(f"🧟‍♂️ **Negan says:** {quote}")
+        await interaction.response.send_message(f"**Negan says:** {quote}")
