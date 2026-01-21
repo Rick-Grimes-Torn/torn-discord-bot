@@ -67,29 +67,23 @@ async def torn_get(path: str, params: Optional[dict] = None, timeout: Optional[f
 
 async def fetch_user_status(user_id: int) -> Dict[str, Any]:
     """
-    Fetches user profile (v2) and returns normalized status dict.
-
-    Uses v2 query-param ID form:
-      GET /v2/user?id=<id>&selections=profile
-    This is generally safer than relying on path IDs for selections that may fallback. :contentReference[oaicite:2]{index=2}
+    Fetch the user's status using v2.
     """
-    params = {"id": str(int(user_id)), "selections": "profile"}
+    params = {"id": str(int(user_id)), "selections": "basic"}
     data = await torn_get("/user", params=params)
 
-    # Defensive: Torn typing / structure can vary
+    # v2 may return status at top-level, or under "basic" depending on endpoint behavior
     status = data.get("status")
     if isinstance(status, dict):
         return status
 
-    # Sometimes the payload might be nested or missing; treat as unavailable
-    return {}
+    basic = data.get("basic")
+    if isinstance(basic, dict):
+        s2 = basic.get("status")
+        if isinstance(s2, dict):
+            return s2
 
-async def fetch_faction_members() -> List[dict]:
-    data = await torn_get("/faction/members")
-    members = data.get("members", [])
-    if not isinstance(members, list):
-        raise RuntimeError("Unexpected Torn API response: 'members' is not a list")
-    return members
+    return {}
 
 
 async def fetch_faction_balance() -> dict:

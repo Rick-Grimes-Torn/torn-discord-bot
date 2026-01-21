@@ -97,6 +97,7 @@ class ChainWatcher:
       - online, OR
       - opted-in via /pingme (even if offline)
     """
+
     def get_status_snapshot(self, guild_id: int) -> dict:
         """
         Returns a small, safe snapshot of watcher state for /chainstatus and /status.
@@ -241,7 +242,11 @@ class ChainWatcher:
         if target:
             target_line = CFG.msg_target_line.format(url=target.url)
         else:
-            target_line = CFG.msg_target_none
+            err = getattr(self.target_picker, "last_error", None)
+            if err:
+                target_line = CFG.msg_target_none + f"\nℹ️ debug: `{err}`"
+            else:
+                target_line = CFG.msg_target_none
 
         await channel.send(
             CFG.msg_alert_header.format(
