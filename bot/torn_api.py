@@ -379,6 +379,68 @@ async def get_user_warstats(torn_user_id: int) -> Dict[str, Any]:
         "backfill_to": int(st.backfill_to) if (st and st.backfill_to is not None) else None,
     }
 
+async def fetch_faction_balance() -> dict:
+    return await torn_get("/faction/balance")
+def _safe_int(v, default: Optional[int] = None) -> Optional[int]:
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
+async def fetch_faction_chain() -> Dict[str, Any]:
+    data = await torn_get("/faction/chain")
+    return data if isinstance(data, dict) else {}
+
+async def fetch_user_status(user_id: int) -> Dict[str, Any]:
+    params = {"id": str(int(user_id)), "selections": "basic"}
+    data = await torn_get("/user", params=params)
+
+    status = data.get("status")
+    if isinstance(status, dict):
+        return status
+
+    basic = data.get("basic")
+    if isinstance(basic, dict):
+        s2 = basic.get("status")
+        if isinstance(s2, dict):
+            return s2
+
+    return {}
+
+
+def parse_active_chain(payload: dict) -> Optional[dict]:
+    if not isinstance(payload, dict):
+        return None
+
+    chain = payload.get("chain")
+    if not isinstance(chain, dict):
+        return None
+
+    chain_id = _safe_int(chain.get("id"))
+    if not chain_id or chain_id <= 0:
+        return None
+
+    timeout = _safe_int(chain.get("timeout"), 0) or 0
+
+    out: Dict[str, Any] = {
+        "id": int(chain_id),
+        "timeout": int(timeout),
+    }
+
+    for k in ("current", "max", "cooldown", "start", "end"):
+        vi = _safe_int(chain.get(k))
+        if vi is not None:
+            out[k] = int(vi)
+
+    try:
+        if chain.get("modifier") is not None:
+            out["modifier"] = float(chain.get("modifier"))
+    except Exception:
+        pass
+
+    return out
+
 
 async def get_all_warstats() -> Dict[str, Any]:
     """
