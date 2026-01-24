@@ -4,16 +4,11 @@ from . import faction
 from . import api_keys
 from . import balance
 from . import leader
-from . import war_stats
-from . import leaderboard
 from . import help_cmd
 from . import chain_timer
 from . import negan
 from . import status_cmd
-from . import war_chain_stats
 from . import market
-from . import war
-from . import chain
 from . import neganquote
 from . import warstats
 
@@ -51,17 +46,13 @@ def register_all(client, tree):
 #   _call_register(api_keys, client, tree)
     _call_register(balance, client, tree)
     _call_register(leader, client, tree)
-#   _call_register(war_stats, client, tree)
-#   _call_register(leaderboard, client, tree)
     _call_register(help_cmd, client, tree)
     _call_register(negan, client, tree)
 #   _call_register(chain_timer, client, tree)
     _call_register(status_cmd, client, tree)
-#   _call_register(war_chain_stats, client, tree)
     _call_register(market, client, tree)
-    _call_register(war, client, tree)
-    _call_register(chain, client, tree)
     _call_register(neganquote, client, tree)
+    _call_register(warstats, client, tree)
 
 
 
