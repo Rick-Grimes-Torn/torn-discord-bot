@@ -23,6 +23,7 @@ from .db import (
 # ----------------------------
 _db_conn: Optional[sqlite3.Connection] = None
 
+
 def set_db_conn(con: sqlite3.Connection) -> None:
     global _db_conn
     _db_conn = con
@@ -263,9 +264,12 @@ async def scan_faction_attacks_progress(
             break
 
         prev_url = (((page.get("_metadata") or {}).get("links") or {}).get("prev"))
-        to_val = extract_to_from_prev_url(prev_url)
-        if to_val is None:
+        to_next = extract_to_from_prev_url(prev_url)
+        if to_next is None:
             break
+
+        # IMPORTANT: make pagination exclusive to avoid duplicating the boundary item
+        to_val = max(int(to_next) - 1, 0)
 
     st.last_ts = int(new_cursor_ts)
     st.last_attack_id = int(new_cursor_id)
@@ -334,8 +338,11 @@ async def scan_faction_attacks_progress(
                 st.backfill_to = None
                 break
 
-            st.backfill_to = int(next_to)
-            to_val = int(next_to)
+            # IMPORTANT: make pagination exclusive to avoid duplicating the boundary item
+            next_to_excl = max(int(next_to) - 1, 0)
+
+            st.backfill_to = int(next_to_excl)
+            to_val = int(next_to_excl)
 
     war_global_save(_db_conn, st)
     return int(st.is_initialized), int(pages_scanned)
@@ -379,8 +386,11 @@ async def get_user_warstats(torn_user_id: int) -> Dict[str, Any]:
         "backfill_to": int(st.backfill_to) if (st and st.backfill_to is not None) else None,
     }
 
+
 async def fetch_faction_balance() -> dict:
     return await torn_get("/faction/balance")
+
+
 def _safe_int(v, default: Optional[int] = None) -> Optional[int]:
     try:
         return int(v)
@@ -391,6 +401,7 @@ def _safe_int(v, default: Optional[int] = None) -> Optional[int]:
 async def fetch_faction_chain() -> Dict[str, Any]:
     data = await torn_get("/faction/chain")
     return data if isinstance(data, dict) else {}
+
 
 async def fetch_user_status(user_id: int) -> Dict[str, Any]:
     params = {"id": str(int(user_id)), "selections": "basic"}
@@ -478,6 +489,8 @@ async def get_all_warstats() -> Dict[str, Any]:
         "rows": out_rows,
         "is_initialized": int(st.is_initialized) if st else 0,
     }
+
+
 # -------------------------------------------------------------------
 # Backwards-compatible aliases for older command modules
 # -------------------------------------------------------------------
