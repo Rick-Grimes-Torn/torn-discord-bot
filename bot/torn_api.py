@@ -1,4 +1,3 @@
-# bot/torn_api.py
 import time
 import asyncio
 from typing import Optional, List, Tuple, Dict, Any
@@ -10,26 +9,19 @@ from .config import (
     TORN_API_KEY,
     TORN_BASE,
     WAR_START_CACHE_TTL_SECONDS,
-    USER_STATS_CACHE_TTL_SECONDS,
     TORN_TIMEOUT_SECONDS,
 )
 from .utils import extract_to_from_prev_url
-from .db import war_state_get, war_state_reset, war_state_save
+from .db import (
+    war_global_get, war_global_reset, war_global_save,
+    war_agg_apply, war_agg_get, war_agg_list_all
+)
 
 
-# -------------------------------------------------------------------
-# Internal caches
-# -------------------------------------------------------------------
-
-_war_start_cache: Dict[str, Any] = {"ts": None, "fetched_at": 0}
-_user_stats_cache: Dict[int, Dict[str, Any]] = {}
-_inflight_user_scans: Dict[int, asyncio.Task] = {}
-_war_window_stats_cache: Dict[int, Dict[str, Any]] = {}
-_inflight_war_window_scans: Dict[int, asyncio.Task] = {}
-
+# ----------------------------
 # DB connection injected from main.py
+# ----------------------------
 _db_conn: Optional[sqlite3.Connection] = None
-
 
 def set_db_conn(con: sqlite3.Connection) -> None:
     global _db_conn
@@ -37,14 +29,29 @@ def set_db_conn(con: sqlite3.Connection) -> None:
 
 
 # -------------------------------------------------------------------
+# Internal caches
+# -------------------------------------------------------------------
+_war_start_cache: Dict[str, Any] = {"ts": None, "fetched_at": 0}
+
+# Optional tiny cache for faction members -> names (used in leadership list)
+_member_name_cache: Dict[str, Any] = {"fetched_at": 0, "map": {}}
+
+
+# -------------------------------------------------------------------
 # Small helpers
 # -------------------------------------------------------------------
-
 def _safe_int0(v) -> int:
     try:
         return int(v)
     except Exception:
         return 0
+
+
+def _safe_float(v) -> Optional[float]:
+    try:
+        return float(v)
+    except Exception:
+        return None
 
 
 def _raise_torn_error(data) -> None:
@@ -61,7 +68,6 @@ def _raise_torn_error(data) -> None:
 # -------------------------------------------------------------------
 # Core HTTP helper
 # -------------------------------------------------------------------
-
 async def torn_get(path: str, params: Optional[dict] = None, timeout: Optional[float] = None) -> dict:
     headers = {
         "Authorization": f"ApiKey {TORN_API_KEY}",
@@ -95,21 +101,16 @@ async def torn_get(path: str, params: Optional[dict] = None, timeout: Optional[f
 # -------------------------------------------------------------------
 # Faction endpoints
 # -------------------------------------------------------------------
+async def fetch_faction_wars() -> dict:
+    return await torn_get("/faction/wars")
+
 
 async def fetch_faction_members() -> List[dict]:
     data = await torn_get("/faction/members")
     members = data.get("members", [])
     if not isinstance(members, list):
-        raise RuntimeError("Unexpected Torn API response: 'members' is not a list")
+        return []
     return members
-
-
-async def fetch_faction_balance() -> dict:
-    return await torn_get("/faction/balance")
-
-
-async def fetch_faction_wars() -> dict:
-    return await torn_get("/faction/wars")
 
 
 async def fetch_faction_attacks_outgoing(limit: int = 100, to: Optional[int] = None) -> dict:
@@ -120,9 +121,8 @@ async def fetch_faction_attacks_outgoing(limit: int = 100, to: Optional[int] = N
 
 
 # -------------------------------------------------------------------
-# Ranked war helpers
+# Ranked war start helpers
 # -------------------------------------------------------------------
-
 def get_latest_ranked_war_start(wars_payload: dict) -> Optional[int]:
     wars = wars_payload.get("wars") or {}
     ranked = wars.get("ranked") or {}
@@ -148,44 +148,67 @@ async def get_cached_ranked_war_start() -> int:
     if not war_start:
         raise RuntimeError("Could not find latest ranked war start timestamp.")
 
-    # war changed -> clear in-memory caches (DB state resets per-user anyway)
-    if cached_ts is not None and int(cached_ts) != int(war_start):
-        _user_stats_cache.clear()
-        _war_window_stats_cache.clear()
-
     _war_start_cache["ts"] = int(war_start)
     _war_start_cache["fetched_at"] = now
     return int(war_start)
 
 
 # -------------------------------------------------------------------
-# Shared scanning engine pieces
+# Member name lookup (leadership list prettiness)
 # -------------------------------------------------------------------
+async def get_member_name_map(ttl_seconds: int = 300) -> Dict[int, str]:
+    now = int(time.time())
+    if (now - int(_member_name_cache.get("fetched_at") or 0)) <= ttl_seconds:
+        mp = _member_name_cache.get("map") or {}
+        return {int(k): str(v) for k, v in mp.items()}
 
-async def _head_scan_update_state(
-    *,
-    torn_user_id: int,
-    mode: str,
-    st,
-    war_start: int,
-    count_ranked_only: bool,
-    split_in_out: bool,
-    head_pages: int = 2,
+    members = await fetch_faction_members()
+    mp2: Dict[int, str] = {}
+    for m in members:
+        if not isinstance(m, dict):
+            continue
+        mid = _safe_int0(m.get("id"))
+        name = m.get("name")
+        if mid > 0 and isinstance(name, str) and name:
+            mp2[mid] = name
+
+    _member_name_cache["fetched_at"] = now
+    _member_name_cache["map"] = dict(mp2)
+    return mp2
+
+
+# -------------------------------------------------------------------
+# Global scan engine (one scan updates everyone)
+# -------------------------------------------------------------------
+async def scan_faction_attacks_progress(
+    pages_head: int = 1,
+    pages_backfill: int = 3,
 ) -> Tuple[int, int]:
     """
-    Scan newest pages and STOP once we hit last_ts/last_attack_id.
-    Updates:
-      - st aggregates (only for this user)
-      - st.last_ts / st.last_attack_id to newest seen in head scan
-    Returns: (next_to_after_head_scan, pages_scanned_flag_cursor_set)
+    Progress the global scan.
+    Returns: (is_initialized, pages_scanned_estimate)
     """
-    to_val: Optional[int] = None
+    if _db_conn is None:
+        raise RuntimeError("DB connection not set in torn_api (set_db_conn not called).")
 
+    war_start = await get_cached_ranked_war_start()
+
+    st = war_global_get(_db_conn, war_start)
+    if st is None:
+        st = war_global_reset(_db_conn, war_start)
+
+    pages_scanned = 0
+
+    # -------------------------
+    # HEAD SCAN (newest hits)
+    # -------------------------
+    to_val: Optional[int] = None
     new_cursor_ts = int(st.last_ts)
     new_cursor_id = int(st.last_attack_id)
 
-    for _ in range(head_pages):
+    for _ in range(pages_head):
         page = await fetch_faction_attacks_outgoing(limit=100, to=to_val)
+        pages_scanned += 1
         attacks = page.get("attacks", [])
         if not isinstance(attacks, list) or not attacks:
             break
@@ -201,45 +224,40 @@ async def _head_scan_update_state(
 
             attack_id_i = _safe_int0(a.get("id"))
 
-            # Stop when we reach already-processed region (prevents infinite rescan)
+            # stop when we reach already processed boundary
             if (started < st.last_ts) or (started == st.last_ts and attack_id_i <= st.last_attack_id):
                 stop = True
                 break
 
-            # Track newest cursor across faction feed
+            if started < war_start:
+                # shouldn't happen in head scan, but safe
+                continue
+
+            # update cursor to newest seen
             if (started > new_cursor_ts) or (started == new_cursor_ts and attack_id_i > new_cursor_id):
                 new_cursor_ts, new_cursor_id = started, attack_id_i
 
-            # Filter to this user
+            # won-only: respect_gain > 0
+            rg = a.get("respect_gain")
+            try:
+                rgf = float(rg)
+            except Exception:
+                rgf = 0.0
+            if rgf <= 0:
+                continue
+
             attacker = a.get("attacker") or {}
-            if _safe_int0(attacker.get("id")) != int(torn_user_id):
+            attacker_id = _safe_int0(attacker.get("id"))
+            if attacker_id <= 0:
                 continue
-
-            # For ranked-only mode, only count ranked war hits
-            is_ranked = bool(a.get("is_ranked_war", False))
-            if count_ranked_only and not is_ranked:
-                continue
-
-            # War start guard (just in case)
-            if started < int(war_start):
-                continue
-
-            st.total += 1
-
-            if split_in_out:
-                if is_ranked:
-                    st.in_war += 1
-                else:
-                    st.out_war += 1
 
             modifiers = a.get("modifiers") or {}
-            ff = (modifiers or {}).get("fair_fight")
-            try:
-                if ff is not None:
-                    st.ff_sum += float(ff)
-                    st.ff_count += 1
-            except Exception:
-                pass
+            war_mod = _safe_int0(modifiers.get("war"))
+            is_ranked = (war_mod == 2) or bool(a.get("is_ranked_war", False))
+
+            ff = _safe_float(modifiers.get("fair_fight"))
+
+            war_agg_apply(_db_conn, war_start, attacker_id, is_ranked, ff)
 
         if stop:
             break
@@ -252,357 +270,149 @@ async def _head_scan_update_state(
     st.last_ts = int(new_cursor_ts)
     st.last_attack_id = int(new_cursor_id)
 
-    # After head scan, to_val is the "next older" cursor
-    return (int(to_val) if to_val is not None else None)
+    # initialize backfill cursor once so we don't keep re-reading newest pages
+    if st.is_initialized == 0 and st.backfill_to is None:
+        st.backfill_to = int(to_val) if to_val is not None else None
 
+    # -------------------------
+    # BACKFILL (older pages)
+    # -------------------------
+    if st.is_initialized == 0:
+        to_val = st.backfill_to
 
-async def _backfill_progress(
-    *,
-    torn_user_id: int,
-    mode: str,
-    st,
-    war_start: int,
-    count_ranked_only: bool,
-    split_in_out: bool,
-    backfill_pages: int = 3,
-) -> None:
-    """
-    Progressive backfill:
-    - continues from st.backfill_to (None means start from newest page)
-    - scans a few pages per call
-    - stops when started < war_start and marks initialized
-    """
-    to_val = st.backfill_to  # may be None
-
-    for _ in range(backfill_pages):
-        page = await fetch_faction_attacks_outgoing(limit=100, to=to_val)
-        attacks = page.get("attacks", [])
-        if not isinstance(attacks, list) or not attacks:
-            st.is_initialized = 1
-            st.backfill_to = None
-            return
-
-        stop = False
-        for a in attacks:
-            if not isinstance(a, dict):
-                continue
-
-            started = a.get("started")
-            if not isinstance(started, int):
-                continue
-
-            if started < int(war_start):
-                stop = True
+        for _ in range(pages_backfill):
+            page = await fetch_faction_attacks_outgoing(limit=100, to=to_val)
+            pages_scanned += 1
+            attacks = page.get("attacks", [])
+            if not isinstance(attacks, list) or not attacks:
+                st.is_initialized = 1
+                st.backfill_to = None
                 break
 
-            # Filter to this user
-            attacker = a.get("attacker") or {}
-            if _safe_int0(attacker.get("id")) != int(torn_user_id):
-                continue
+            stop = False
+            for a in attacks:
+                if not isinstance(a, dict):
+                    continue
 
-            is_ranked = bool(a.get("is_ranked_war", False))
-            if count_ranked_only and not is_ranked:
-                continue
+                started = a.get("started")
+                if not isinstance(started, int):
+                    continue
 
-            st.total += 1
+                if started < war_start:
+                    stop = True
+                    break
 
-            if split_in_out:
-                if is_ranked:
-                    st.in_war += 1
-                else:
-                    st.out_war += 1
+                # won-only
+                try:
+                    rgf = float(a.get("respect_gain") or 0)
+                except Exception:
+                    rgf = 0.0
+                if rgf <= 0:
+                    continue
 
-            modifiers = a.get("modifiers") or {}
-            ff = (modifiers or {}).get("fair_fight")
-            try:
-                if ff is not None:
-                    st.ff_sum += float(ff)
-                    st.ff_count += 1
-            except Exception:
-                pass
+                attacker = a.get("attacker") or {}
+                attacker_id = _safe_int0(attacker.get("id"))
+                if attacker_id <= 0:
+                    continue
 
-        if stop:
-            st.is_initialized = 1
-            st.backfill_to = None
-            return
+                modifiers = a.get("modifiers") or {}
+                war_mod = _safe_int0(modifiers.get("war"))
+                is_ranked = (war_mod == 2) or bool(a.get("is_ranked_war", False))
+                ff = _safe_float(modifiers.get("fair_fight"))
 
-        prev_url = (((page.get("_metadata") or {}).get("links") or {}).get("prev"))
-        next_to = extract_to_from_prev_url(prev_url)
-        if next_to is None:
-            st.is_initialized = 1
-            st.backfill_to = None
-            return
+                war_agg_apply(_db_conn, war_start, attacker_id, is_ranked, ff)
 
-        st.backfill_to = int(next_to)
-        to_val = int(next_to)
+            if stop:
+                st.is_initialized = 1
+                st.backfill_to = None
+                break
 
+            prev_url = (((page.get("_metadata") or {}).get("links") or {}).get("prev"))
+            next_to = extract_to_from_prev_url(prev_url)
+            if next_to is None:
+                st.is_initialized = 1
+                st.backfill_to = None
+                break
 
-# -------------------------------------------------------------------
-# Ranked war stats (per user)
-# -------------------------------------------------------------------
+            st.backfill_to = int(next_to)
+            to_val = int(next_to)
 
-async def _compute_ranked_war_stats_for_user(torn_user_id: int) -> Tuple[int, float, int, int]:
-    war_start = await get_cached_ranked_war_start()
-
-    if _db_conn is None:
-        # Fall back to old behavior if DB not wired (shouldn't happen in your bot)
-        raise RuntimeError("DB connection not set in torn_api (set_db_conn not called).")
-
-    st = war_state_get(_db_conn, "ranked", int(torn_user_id))
-    if (st is None) or (int(st.war_start) != int(war_start)):
-        st = war_state_reset(_db_conn, "ranked", int(torn_user_id), int(war_start))
-
-    # 1) Head scan to pick up newest hits (and advance last_ts/last_attack_id)
-    next_to_after_head = await _head_scan_update_state(
-        torn_user_id=int(torn_user_id),
-        mode="ranked",
-        st=st,
-        war_start=int(war_start),
-        count_ranked_only=True,
-        split_in_out=False,
-        head_pages=2,
-    )
-
-    # Initialize backfill cursor once so we don't keep re-scanning the newest pages
-    if st.is_initialized == 0 and st.backfill_to is None:
-        st.backfill_to = next_to_after_head
-
-    # 2) Progressive backfill until war_start reached
-    if st.is_initialized == 0:
-        await _backfill_progress(
-            torn_user_id=int(torn_user_id),
-            mode="ranked",
-            st=st,
-            war_start=int(war_start),
-            count_ranked_only=True,
-            split_in_out=False,
-            backfill_pages=3,
-        )
-
-    war_state_save(_db_conn, st)
-    return int(st.total), float(st.ff_sum), int(st.ff_count), int(war_start)
-
-
-async def scan_ranked_war_stats_for_user(torn_user_id: int) -> Tuple[int, float, int, int]:
-    now = int(time.time())
-    war_start = await get_cached_ranked_war_start()
-
-    cached = _user_stats_cache.get(int(torn_user_id))
-
-    # If DB state exists and we're still backfilling, force recompute so each call makes progress.
-    if _db_conn is not None:
-        st = war_state_get(_db_conn, "ranked", int(torn_user_id))
-        if st is not None and int(st.is_initialized) == 0:
-            cached = None
-
-    if cached:
-        if (
-            int(cached.get("war_start")) == int(war_start)
-            and (now - int(cached.get("computed_at", 0))) <= USER_STATS_CACHE_TTL_SECONDS
-        ):
-            return (
-                int(cached["attacks"]),
-                float(cached["ff_sum"]),
-                int(cached["ff_count"]),
-                int(war_start),
-            )
-
-    inflight = _inflight_user_scans.get(int(torn_user_id))
-    if inflight and not inflight.done():
-        return await inflight
-
-    async def _runner():
-        try:
-            result = await _compute_ranked_war_stats_for_user(int(torn_user_id))
-            a_count, ff_sum, ff_count, ws = result
-            _user_stats_cache[int(torn_user_id)] = {
-                "war_start": int(ws),
-                "computed_at": int(time.time()),
-                "attacks": int(a_count),
-                "ff_sum": float(ff_sum),
-                "ff_count": int(ff_count),
-            }
-            return result
-        finally:
-            _inflight_user_scans.pop(int(torn_user_id), None)
-
-    task = asyncio.create_task(_runner())
-    _inflight_user_scans[int(torn_user_id)] = task
-    return await task
+    war_global_save(_db_conn, st)
+    return int(st.is_initialized), int(pages_scanned)
 
 
 # -------------------------------------------------------------------
-# War window stats (per user)
+# Public stats accessors for commands
 # -------------------------------------------------------------------
-
-async def _compute_war_window_stats_for_user(torn_user_id: int) -> Tuple[int, int, int, float, int, int]:
-    war_start = await get_cached_ranked_war_start()
-
+async def get_user_warstats(torn_user_id: int) -> Dict[str, Any]:
+    """
+    Returns dict containing wins + ff sums/counts for current war_start.
+    Also triggers a small scan burst to keep progress moving.
+    """
     if _db_conn is None:
         raise RuntimeError("DB connection not set in torn_api (set_db_conn not called).")
 
-    st = war_state_get(_db_conn, "window", int(torn_user_id))
-    if (st is None) or (int(st.war_start) != int(war_start)):
-        st = war_state_reset(_db_conn, "window", int(torn_user_id), int(war_start))
-
-    # 1) Head scan (newest)
-    next_to_after_head = await _head_scan_update_state(
-        torn_user_id=int(torn_user_id),
-        mode="window",
-        st=st,
-        war_start=int(war_start),
-        count_ranked_only=False,
-        split_in_out=True,
-        head_pages=2,
-    )
-
-    if st.is_initialized == 0 and st.backfill_to is None:
-        st.backfill_to = next_to_after_head
-
-    # 2) Backfill
-    if st.is_initialized == 0:
-        await _backfill_progress(
-            torn_user_id=int(torn_user_id),
-            mode="window",
-            st=st,
-            war_start=int(war_start),
-            count_ranked_only=False,
-            split_in_out=True,
-            backfill_pages=3,
-        )
-
-    war_state_save(_db_conn, st)
-
-    return (
-        int(st.total),
-        int(st.in_war),
-        int(st.out_war),
-        float(st.ff_sum),
-        int(st.ff_count),
-        int(war_start),
-    )
-
-
-async def scan_war_window_stats_for_user(torn_user_id: int) -> Tuple[int, int, int, float, int, int]:
-    now = int(time.time())
     war_start = await get_cached_ranked_war_start()
 
-    cached = _war_window_stats_cache.get(int(torn_user_id))
+    # kick scan a little to keep data fresh
+    await scan_faction_attacks_progress(pages_head=1, pages_backfill=2)
 
-    # If still backfilling, disable TTL cache so repeated calls progress the cursor.
-    if _db_conn is not None:
-        st = war_state_get(_db_conn, "window", int(torn_user_id))
-        if st is not None and int(st.is_initialized) == 0:
-            cached = None
+    agg = war_agg_get(_db_conn, war_start, int(torn_user_id))
+    ranked_wins = int(agg["ranked_wins"])
+    other_wins = int(agg["other_wins"])
 
-    if cached:
-        if (
-            int(cached.get("war_start")) == int(war_start)
-            and (now - int(cached.get("computed_at", 0))) <= USER_STATS_CACHE_TTL_SECONDS
-        ):
-            return (
-                int(cached["total"]),
-                int(cached["in_war"]),
-                int(cached["out_war"]),
-                float(cached["ff_sum"]),
-                int(cached["ff_count"]),
-                int(war_start),
-            )
+    ranked_ff_count = int(agg["ranked_ff_count"])
+    ranked_ff_avg = (float(agg["ranked_ff_sum"]) / ranked_ff_count) if ranked_ff_count > 0 else None
 
-    inflight = _inflight_war_window_scans.get(int(torn_user_id))
-    if inflight and not inflight.done():
-        return await inflight
+    total_ff_count = int(agg["total_ff_count"])
+    total_ff_avg = (float(agg["total_ff_sum"]) / total_ff_count) if total_ff_count > 0 else None
 
-    async def _runner():
-        try:
-            result = await _compute_war_window_stats_for_user(int(torn_user_id))
-            total, in_war, out_war, ff_sum, ff_count, ws = result
-            _war_window_stats_cache[int(torn_user_id)] = {
-                "war_start": int(ws),
-                "computed_at": int(time.time()),
-                "total": int(total),
-                "in_war": int(in_war),
-                "out_war": int(out_war),
-                "ff_sum": float(ff_sum),
-                "ff_count": int(ff_count),
-            }
-            return result
-        finally:
-            _inflight_war_window_scans.pop(int(torn_user_id), None)
+    st = war_global_get(_db_conn, war_start)
 
-    task = asyncio.create_task(_runner())
-    _inflight_war_window_scans[int(torn_user_id)] = task
-    return await task
-
-
-# -------------------------------------------------------------------
-# Chain (v2)
-# -------------------------------------------------------------------
-
-def _safe_int(v, default: Optional[int] = None) -> Optional[int]:
-    try:
-        return int(v)
-    except Exception:
-        return default
-
-
-async def fetch_faction_chain() -> Dict[str, Any]:
-    data = await torn_get("/faction/chain")
-    return data if isinstance(data, dict) else {}
-
-
-def parse_active_chain(payload: dict) -> Optional[dict]:
-    if not isinstance(payload, dict):
-        return None
-
-    chain = payload.get("chain")
-    if not isinstance(chain, dict):
-        return None
-
-    chain_id = _safe_int(chain.get("id"))
-    if not chain_id or chain_id <= 0:
-        return None
-
-    timeout = _safe_int(chain.get("timeout"), 0) or 0
-
-    out: Dict[str, Any] = {
-        "id": int(chain_id),
-        "timeout": int(timeout),
+    return {
+        "war_start": int(war_start),
+        "ranked_wins": ranked_wins,
+        "other_wins": other_wins,
+        "ranked_ff_avg": ranked_ff_avg,
+        "total_ff_avg": total_ff_avg,
+        "is_initialized": int(st.is_initialized) if st else 0,
+        "backfill_to": int(st.backfill_to) if (st and st.backfill_to is not None) else None,
     }
 
-    for k in ("current", "max", "cooldown", "start", "end"):
-        vi = _safe_int(chain.get(k))
-        if vi is not None:
-            out[k] = int(vi)
 
-    try:
-        if chain.get("modifier") is not None:
-            out["modifier"] = float(chain.get("modifier"))
-    except Exception:
-        pass
-
-    return out
-
-
-# -------------------------------------------------------------------
-# USER STATUS (NEW)
-# -------------------------------------------------------------------
-
-async def fetch_user_status(user_id: int) -> Dict[str, Any]:
+async def get_all_warstats() -> Dict[str, Any]:
     """
-    Fetch user status via v2. Returns status dict or {}.
+    Leadership list: returns all aggregates for current war_start.
+    Also triggers a scan burst.
     """
-    params = {"id": str(int(user_id)), "selections": "basic"}
-    data = await torn_get("/user", params=params)
+    if _db_conn is None:
+        raise RuntimeError("DB connection not set in torn_api (set_db_conn not called).")
 
-    status = data.get("status")
-    if isinstance(status, dict):
-        return status
+    war_start = await get_cached_ranked_war_start()
+    await scan_faction_attacks_progress(pages_head=1, pages_backfill=3)
 
-    basic = data.get("basic")
-    if isinstance(basic, dict):
-        s2 = basic.get("status")
-        if isinstance(s2, dict):
-            return s2
+    rows = war_agg_list_all(_db_conn, war_start)
+    st = war_global_get(_db_conn, war_start)
 
-    return {}
+    name_map = await get_member_name_map()
+
+    # decorate rows with name + averages
+    out_rows: List[Dict[str, Any]] = []
+    for r in rows:
+        ranked_ff_avg = (r["ranked_ff_sum"] / r["ranked_ff_count"]) if r["ranked_ff_count"] > 0 else None
+        total_ff_avg = (r["total_ff_sum"] / r["total_ff_count"]) if r["total_ff_count"] > 0 else None
+        tid = int(r["torn_id"])
+        out_rows.append({
+            "torn_id": tid,
+            "name": name_map.get(tid, f"[{tid}]"),
+            "ranked_wins": int(r["ranked_wins"]),
+            "other_wins": int(r["other_wins"]),
+            "ranked_ff_avg": ranked_ff_avg,
+            "total_ff_avg": total_ff_avg,
+        })
+
+    return {
+        "war_start": int(war_start),
+        "rows": out_rows,
+        "is_initialized": int(st.is_initialized) if st else 0,
+    }

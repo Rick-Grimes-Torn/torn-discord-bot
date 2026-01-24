@@ -1,11 +1,9 @@
-# bot/db.py
 import sqlite3
 import time
+from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
-from typing import Optional
 
 from cryptography.fernet import Fernet
-
 from .config import DB_PATH, BOT_MASTER_KEY
 
 fernet = Fernet(BOT_MASTER_KEY.encode("utf-8"))
@@ -16,13 +14,8 @@ fernet = Fernet(BOT_MASTER_KEY.encode("utf-8"))
 # -----------------------------
 
 def db_init() -> sqlite3.Connection:
-    """
-    Open (and initialize) the SQLite database and return a connection
-    intended to stay open for the bot's lifetime.
-    """
-    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con = sqlite3.connect(DB_PATH)
 
-    # Better concurrency characteristics
     try:
         con.execute("PRAGMA journal_mode=WAL;")
     except Exception:
@@ -49,44 +42,40 @@ def db_init() -> sqlite3.Connection:
         )
     """)
 
-    # War scan state (checkpoint + backfill cursor + rolling aggregates)
+    # Global faction scan state (one cursor per war_start)
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS war_scan_state (
-            mode TEXT NOT NULL,               -- 'ranked' or 'window'
-            torn_id INTEGER NOT NULL,
-            war_start INTEGER NOT NULL,
+        CREATE TABLE IF NOT EXISTS war_scan_global (
+            war_start INTEGER PRIMARY KEY,
 
-            -- newest processed marker (post-initialization)
-            last_ts INTEGER NOT NULL,
-            last_attack_id INTEGER NOT NULL,
+            last_ts INTEGER NOT NULL DEFAULT 0,
+            last_attack_id INTEGER NOT NULL DEFAULT 0,
 
-            -- backfill cursor (pre-initialization)
             backfill_to INTEGER,
             is_initialized INTEGER NOT NULL DEFAULT 0,
 
-            total INTEGER NOT NULL DEFAULT 0,
-            in_war INTEGER NOT NULL DEFAULT 0,
-            out_war INTEGER NOT NULL DEFAULT 0,
-
-            ff_sum REAL NOT NULL DEFAULT 0,
-            ff_count INTEGER NOT NULL DEFAULT 0,
-
-            updated_at INTEGER NOT NULL,
-            PRIMARY KEY (mode, torn_id)
+            updated_at INTEGER NOT NULL
         )
     """)
 
-    # One-time migrations for older DBs (safe no-ops if already applied)
-    migrations = [
-        "ALTER TABLE war_scan_state ADD COLUMN last_attack_id INTEGER NOT NULL DEFAULT 0;",
-        "ALTER TABLE war_scan_state ADD COLUMN backfill_to INTEGER;",
-        "ALTER TABLE war_scan_state ADD COLUMN is_initialized INTEGER NOT NULL DEFAULT 0;",
-    ]
-    for stmt in migrations:
-        try:
-            cur.execute(stmt)
-        except sqlite3.OperationalError:
-            pass
+    # Per-user rolling aggregates (won-only)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS war_user_agg (
+            war_start INTEGER NOT NULL,
+            torn_id INTEGER NOT NULL,
+
+            ranked_wins INTEGER NOT NULL DEFAULT 0,
+            other_wins INTEGER NOT NULL DEFAULT 0,
+
+            ranked_ff_sum REAL NOT NULL DEFAULT 0,
+            ranked_ff_count INTEGER NOT NULL DEFAULT 0,
+
+            total_ff_sum REAL NOT NULL DEFAULT 0,
+            total_ff_count INTEGER NOT NULL DEFAULT 0,
+
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (war_start, torn_id)
+        )
+    """)
 
     con.commit()
     return con
@@ -102,133 +91,6 @@ def encrypt_key(api_key: str) -> bytes:
 
 def decrypt_key(enc: bytes) -> str:
     return fernet.decrypt(enc).decode("utf-8")
-
-
-# -----------------------------
-# WAR SCAN STATE
-# -----------------------------
-
-@dataclass
-class WarScanState:
-    mode: str
-    torn_id: int
-    war_start: int
-
-    last_ts: int
-    last_attack_id: int
-
-    backfill_to: Optional[int]
-    is_initialized: int
-
-    total: int
-    in_war: int
-    out_war: int
-
-    ff_sum: float
-    ff_count: int
-
-    updated_at: int
-
-
-def war_state_get(con: sqlite3.Connection, mode: str, torn_id: int) -> Optional[WarScanState]:
-    cur = con.cursor()
-    cur.execute("""
-        SELECT
-            mode, torn_id, war_start,
-            last_ts, last_attack_id,
-            backfill_to, is_initialized,
-            total, in_war, out_war,
-            ff_sum, ff_count,
-            updated_at
-        FROM war_scan_state
-        WHERE mode = ? AND torn_id = ?
-    """, (str(mode), int(torn_id)))
-    row = cur.fetchone()
-    if not row:
-        return None
-
-    return WarScanState(
-        mode=str(row[0]),
-        torn_id=int(row[1]),
-        war_start=int(row[2]),
-        last_ts=int(row[3]),
-        last_attack_id=int(row[4]),
-        backfill_to=(int(row[5]) if row[5] is not None else None),
-        is_initialized=int(row[6]),
-        total=int(row[7]),
-        in_war=int(row[8]),
-        out_war=int(row[9]),
-        ff_sum=float(row[10]),
-        ff_count=int(row[11]),
-        updated_at=int(row[12]),
-    )
-
-
-def war_state_reset(con: sqlite3.Connection, mode: str, torn_id: int, war_start: int) -> WarScanState:
-    now = int(time.time())
-    st = WarScanState(
-        mode=str(mode),
-        torn_id=int(torn_id),
-        war_start=int(war_start),
-
-        # before init we don't rely on these, but keep sane defaults
-        last_ts=int(war_start),
-        last_attack_id=0,
-
-        # backfill begins from newest (NULL to= means newest page)
-        backfill_to=None,
-        is_initialized=0,
-
-        total=0,
-        in_war=0,
-        out_war=0,
-        ff_sum=0.0,
-        ff_count=0,
-        updated_at=now,
-    )
-    _war_state_upsert(con, st)
-    return st
-
-
-def war_state_save(con: sqlite3.Connection, st: WarScanState) -> None:
-    st.updated_at = int(time.time())
-    _war_state_upsert(con, st)
-
-
-def _war_state_upsert(con: sqlite3.Connection, st: WarScanState) -> None:
-    cur = con.cursor()
-    cur.execute("""
-        INSERT INTO war_scan_state (
-            mode, torn_id, war_start,
-            last_ts, last_attack_id,
-            backfill_to, is_initialized,
-            total, in_war, out_war,
-            ff_sum, ff_count,
-            updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(mode, torn_id) DO UPDATE SET
-            war_start=excluded.war_start,
-            last_ts=excluded.last_ts,
-            last_attack_id=excluded.last_attack_id,
-            backfill_to=excluded.backfill_to,
-            is_initialized=excluded.is_initialized,
-            total=excluded.total,
-            in_war=excluded.in_war,
-            out_war=excluded.out_war,
-            ff_sum=excluded.ff_sum,
-            ff_count=excluded.ff_count,
-            updated_at=excluded.updated_at
-    """, (
-        st.mode, int(st.torn_id), int(st.war_start),
-        int(st.last_ts), int(st.last_attack_id),
-        (int(st.backfill_to) if st.backfill_to is not None else None),
-        int(st.is_initialized),
-        int(st.total), int(st.in_war), int(st.out_war),
-        float(st.ff_sum), int(st.ff_count),
-        int(st.updated_at),
-    ))
-    con.commit()
 
 
 # -----------------------------
@@ -263,7 +125,7 @@ def delete_user_key(con: sqlite3.Connection, discord_user_id: int) -> bool:
     cur = con.cursor()
     cur.execute("DELETE FROM user_keys WHERE discord_user_id=?", (int(discord_user_id),))
     con.commit()
-    return (cur.rowcount or 0) > 0
+    return cur.rowcount > 0
 
 
 # -----------------------------
@@ -288,6 +150,13 @@ def chain_optin_remove(con: sqlite3.Connection, guild_id: int, user_id: int) -> 
     con.commit()
 
 
+def chain_optin_clear_guild(con: sqlite3.Connection, guild_id: int) -> int:
+    cur = con.cursor()
+    cur.execute("DELETE FROM chain_ping_optin WHERE guild_id = ?", (int(guild_id),))
+    con.commit()
+    return int(cur.rowcount or 0)
+
+
 def chain_optin_list(con: sqlite3.Connection, guild_id: int) -> list[int]:
     cur = con.cursor()
     cur.execute(
@@ -297,12 +166,177 @@ def chain_optin_list(con: sqlite3.Connection, guild_id: int) -> list[int]:
     return [int(row[0]) for row in cur.fetchall()]
 
 
-def chain_optin_clear_guild(con: sqlite3.Connection, guild_id: int) -> int:
-    """
-    Removes ALL /pingme opt-ins for a guild.
-    Returns number of rows deleted.
-    """
+# -----------------------------
+# WAR SCAN GLOBAL + AGGREGATES
+# -----------------------------
+
+@dataclass
+class WarScanGlobalState:
+    war_start: int
+    last_ts: int
+    last_attack_id: int
+    backfill_to: Optional[int]
+    is_initialized: int
+    updated_at: int
+
+
+def war_global_get(con: sqlite3.Connection, war_start: int) -> Optional[WarScanGlobalState]:
     cur = con.cursor()
-    cur.execute("DELETE FROM chain_ping_optin WHERE guild_id = ?", (int(guild_id),))
+    cur.execute("""
+        SELECT war_start, last_ts, last_attack_id, backfill_to, is_initialized, updated_at
+        FROM war_scan_global
+        WHERE war_start = ?
+    """, (int(war_start),))
+    row = cur.fetchone()
+    if not row:
+        return None
+    return WarScanGlobalState(
+        war_start=int(row[0]),
+        last_ts=int(row[1]),
+        last_attack_id=int(row[2]),
+        backfill_to=(int(row[3]) if row[3] is not None else None),
+        is_initialized=int(row[4]),
+        updated_at=int(row[5]),
+    )
+
+
+def war_global_reset(con: sqlite3.Connection, war_start: int) -> WarScanGlobalState:
+    now = int(time.time())
+    st = WarScanGlobalState(
+        war_start=int(war_start),
+        last_ts=int(war_start),          # start cursor at war start
+        last_attack_id=0,
+        backfill_to=None,
+        is_initialized=0,
+        updated_at=now,
+    )
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO war_scan_global (war_start, last_ts, last_attack_id, backfill_to, is_initialized, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(war_start) DO UPDATE SET
+            last_ts=excluded.last_ts,
+            last_attack_id=excluded.last_attack_id,
+            backfill_to=excluded.backfill_to,
+            is_initialized=excluded.is_initialized,
+            updated_at=excluded.updated_at
+    """, (st.war_start, st.last_ts, st.last_attack_id, st.backfill_to, st.is_initialized, st.updated_at))
     con.commit()
-    return int(cur.rowcount or 0)
+    return st
+
+
+def war_global_save(con: sqlite3.Connection, st: WarScanGlobalState) -> None:
+    st.updated_at = int(time.time())
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO war_scan_global (war_start, last_ts, last_attack_id, backfill_to, is_initialized, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(war_start) DO UPDATE SET
+            last_ts=excluded.last_ts,
+            last_attack_id=excluded.last_attack_id,
+            backfill_to=excluded.backfill_to,
+            is_initialized=excluded.is_initialized,
+            updated_at=excluded.updated_at
+    """, (st.war_start, st.last_ts, st.last_attack_id, st.backfill_to, st.is_initialized, st.updated_at))
+    con.commit()
+
+
+def war_agg_apply(
+    con: sqlite3.Connection,
+    war_start: int,
+    torn_id: int,
+    is_ranked: bool,
+    ff_value: Optional[float],
+) -> None:
+    """
+    Apply ONE won hit into aggregates.
+    """
+    now = int(time.time())
+    ranked_inc = 1 if is_ranked else 0
+    other_inc = 0 if is_ranked else 1
+
+    total_ff_sum_inc = float(ff_value) if ff_value is not None else 0.0
+    total_ff_count_inc = 1 if ff_value is not None else 0
+
+    ranked_ff_sum_inc = float(ff_value) if (is_ranked and ff_value is not None) else 0.0
+    ranked_ff_count_inc = 1 if (is_ranked and ff_value is not None) else 0
+
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO war_user_agg (
+            war_start, torn_id,
+            ranked_wins, other_wins,
+            ranked_ff_sum, ranked_ff_count,
+            total_ff_sum, total_ff_count,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(war_start, torn_id) DO UPDATE SET
+            ranked_wins = ranked_wins + excluded.ranked_wins,
+            other_wins  = other_wins  + excluded.other_wins,
+            ranked_ff_sum   = ranked_ff_sum   + excluded.ranked_ff_sum,
+            ranked_ff_count = ranked_ff_count + excluded.ranked_ff_count,
+            total_ff_sum    = total_ff_sum    + excluded.total_ff_sum,
+            total_ff_count  = total_ff_count  + excluded.total_ff_count,
+            updated_at = excluded.updated_at
+    """, (
+        int(war_start), int(torn_id),
+        ranked_inc, other_inc,
+        ranked_ff_sum_inc, ranked_ff_count_inc,
+        total_ff_sum_inc, total_ff_count_inc,
+        now
+    ))
+    con.commit()
+
+
+def war_agg_get(con: sqlite3.Connection, war_start: int, torn_id: int) -> Dict[str, Any]:
+    cur = con.cursor()
+    cur.execute("""
+        SELECT ranked_wins, other_wins,
+               ranked_ff_sum, ranked_ff_count,
+               total_ff_sum, total_ff_count
+        FROM war_user_agg
+        WHERE war_start = ? AND torn_id = ?
+    """, (int(war_start), int(torn_id)))
+    row = cur.fetchone()
+    if not row:
+        return {
+            "ranked_wins": 0,
+            "other_wins": 0,
+            "ranked_ff_sum": 0.0,
+            "ranked_ff_count": 0,
+            "total_ff_sum": 0.0,
+            "total_ff_count": 0,
+        }
+    return {
+        "ranked_wins": int(row[0]),
+        "other_wins": int(row[1]),
+        "ranked_ff_sum": float(row[2]),
+        "ranked_ff_count": int(row[3]),
+        "total_ff_sum": float(row[4]),
+        "total_ff_count": int(row[5]),
+    }
+
+
+def war_agg_list_all(con: sqlite3.Connection, war_start: int) -> List[Dict[str, Any]]:
+    cur = con.cursor()
+    cur.execute("""
+        SELECT torn_id, ranked_wins, other_wins,
+               ranked_ff_sum, ranked_ff_count,
+               total_ff_sum, total_ff_count
+        FROM war_user_agg
+        WHERE war_start = ?
+        ORDER BY ranked_wins DESC, other_wins DESC, torn_id ASC
+    """, (int(war_start),))
+    out: List[Dict[str, Any]] = []
+    for row in cur.fetchall():
+        out.append({
+            "torn_id": int(row[0]),
+            "ranked_wins": int(row[1]),
+            "other_wins": int(row[2]),
+            "ranked_ff_sum": float(row[3]),
+            "ranked_ff_count": int(row[4]),
+            "total_ff_sum": float(row[5]),
+            "total_ff_count": int(row[6]),
+        })
+    return out
