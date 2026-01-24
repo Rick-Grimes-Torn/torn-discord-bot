@@ -14,6 +14,15 @@ from .config import (
 )
 from .utils import extract_to_from_prev_url
 
+import sqlite3
+from .db import war_state_get, war_state_reset, war_state_save, WarScanState
+
+_db_conn: Optional[sqlite3.Connection] = None
+
+def set_db_conn(con: sqlite3.Connection) -> None:
+    global _db_conn
+    _db_conn = con
+
 
 # -------------------------------------------------------------------
 # Internal caches
@@ -141,14 +150,21 @@ async def get_cached_ranked_war_start() -> int:
 # -------------------------------------------------------------------
 
 async def _compute_ranked_war_stats_for_user(torn_user_id: int) -> Tuple[int, float, int, int]:
+    if _db_conn is None:
+        raise RuntimeError("DB connection not set in torn_api. Call torn_api.set_db_conn(client.db_conn).")
+
     war_start = await get_cached_ranked_war_start()
 
-    total_attacks = 0
-    ff_sum = 0.0
-    ff_count = 0
+    # Load or reset state
+    st = war_state_get(_db_conn, "ranked", int(torn_user_id))
+    if (st is None) or (int(st.war_start) != int(war_start)):
+        st = war_state_reset(_db_conn, "ranked", int(torn_user_id), int(war_start))
 
     to_val: Optional[int] = None
-    max_pages = 60
+    max_pages = 5  # ✅ small cap; we should usually stop on page 1
+
+    newest_ts = int(st.last_ts)
+    newest_id = int(st.last_attack_id)
 
     for _ in range(max_pages):
         page = await fetch_faction_attacks_outgoing(limit=100, to=to_val)
@@ -157,6 +173,7 @@ async def _compute_ranked_war_stats_for_user(torn_user_id: int) -> Tuple[int, fl
             break
 
         stop = False
+
         for a in attacks:
             if not isinstance(a, dict):
                 continue
@@ -165,11 +182,28 @@ async def _compute_ranked_war_stats_for_user(torn_user_id: int) -> Tuple[int, fl
             if not isinstance(started, int):
                 continue
 
-            if started < war_start:
+            # Always stop when older than war start
+            if started < int(war_start):
                 stop = True
                 break
 
+            # Cursor: (started, attack_id)
+            attack_id = a.get("id")
+            try:
+                attack_id_i = int(attack_id)
+            except Exception:
+                attack_id_i = 0
+
+            # If we've already processed this (or older), stop scanning deeper
+            if (started < st.last_ts) or (started == st.last_ts and attack_id_i <= st.last_attack_id):
+                stop = True
+                break
+
+            # Only ranked war hits
             if not a.get("is_ranked_war", False):
+                # still update newest cursor (so we don't re-read forever)
+                if (started > newest_ts) or (started == newest_ts and attack_id_i > newest_id):
+                    newest_ts, newest_id = started, attack_id_i
                 continue
 
             attacker = a.get("attacker") or {}
@@ -179,18 +213,23 @@ async def _compute_ranked_war_stats_for_user(torn_user_id: int) -> Tuple[int, fl
                 continue
 
             if attacker_id != int(torn_user_id):
+                if (started > newest_ts) or (started == newest_ts and attack_id_i > newest_id):
+                    newest_ts, newest_id = started, attack_id_i
                 continue
 
-            total_attacks += 1
+            st.total += 1
 
             modifiers = a.get("modifiers") or {}
             ff = modifiers.get("fair_fight")
             try:
                 if ff is not None:
-                    ff_sum += float(ff)
-                    ff_count += 1
+                    st.ff_sum += float(ff)
+                    st.ff_count += 1
             except Exception:
                 pass
+
+            if (started > newest_ts) or (started == newest_ts and attack_id_i > newest_id):
+                newest_ts, newest_id = started, attack_id_i
 
         if stop:
             break
@@ -200,7 +239,12 @@ async def _compute_ranked_war_stats_for_user(torn_user_id: int) -> Tuple[int, fl
         if to_val is None:
             break
 
-    return total_attacks, ff_sum, ff_count, war_start
+    # Save cursor
+    st.last_ts = int(newest_ts)
+    st.last_attack_id = int(newest_id)
+    war_state_save(_db_conn, st)
+
+    return int(st.total), float(st.ff_sum), int(st.ff_count), int(war_start)
 
 
 async def scan_ranked_war_stats_for_user(torn_user_id: int) -> Tuple[int, float, int, int]:
@@ -249,16 +293,20 @@ async def scan_ranked_war_stats_for_user(torn_user_id: int) -> Tuple[int, float,
 # -------------------------------------------------------------------
 
 async def _compute_war_window_stats_for_user(torn_user_id: int) -> Tuple[int, int, int, float, int, int]:
+    if _db_conn is None:
+        raise RuntimeError("DB connection not set in torn_api. Call torn_api.set_db_conn(client.db_conn).")
+
     war_start = await get_cached_ranked_war_start()
 
-    total_attacks = 0
-    in_war_attacks = 0
-    out_of_war_attacks = 0
-    ff_sum = 0.0
-    ff_count = 0
+    st = war_state_get(_db_conn, "window", int(torn_user_id))
+    if (st is None) or (int(st.war_start) != int(war_start)):
+        st = war_state_reset(_db_conn, "window", int(torn_user_id), int(war_start))
 
     to_val: Optional[int] = None
-    max_pages = 60
+    max_pages = 5
+
+    newest_ts = int(st.last_ts)
+    newest_id = int(st.last_attack_id)
 
     for _ in range(max_pages):
         page = await fetch_faction_attacks_outgoing(limit=100, to=to_val)
@@ -267,6 +315,7 @@ async def _compute_war_window_stats_for_user(torn_user_id: int) -> Tuple[int, in
             break
 
         stop = False
+
         for a in attacks:
             if not isinstance(a, dict):
                 continue
@@ -275,7 +324,17 @@ async def _compute_war_window_stats_for_user(torn_user_id: int) -> Tuple[int, in
             if not isinstance(started, int):
                 continue
 
-            if started < war_start:
+            if started < int(war_start):
+                stop = True
+                break
+
+            attack_id = a.get("id")
+            try:
+                attack_id_i = int(attack_id)
+            except Exception:
+                attack_id_i = 0
+
+            if (started < st.last_ts) or (started == st.last_ts and attack_id_i <= st.last_attack_id):
                 stop = True
                 break
 
@@ -285,22 +344,26 @@ async def _compute_war_window_stats_for_user(torn_user_id: int) -> Tuple[int, in
             except Exception:
                 continue
 
+            # advance newest cursor even if it's not this user (prevents rescanning)
+            if (started > newest_ts) or (started == newest_ts and attack_id_i > newest_id):
+                newest_ts, newest_id = started, attack_id_i
+
             if attacker_id != int(torn_user_id):
                 continue
 
-            total_attacks += 1
+            st.total += 1
 
             if a.get("is_ranked_war", False):
-                in_war_attacks += 1
+                st.in_war += 1
             else:
-                out_of_war_attacks += 1
+                st.out_war += 1
 
             modifiers = a.get("modifiers") or {}
             ff = modifiers.get("fair_fight")
             try:
                 if ff is not None:
-                    ff_sum += float(ff)
-                    ff_count += 1
+                    st.ff_sum += float(ff)
+                    st.ff_count += 1
             except Exception:
                 pass
 
@@ -312,14 +375,11 @@ async def _compute_war_window_stats_for_user(torn_user_id: int) -> Tuple[int, in
         if to_val is None:
             break
 
-    return (
-        total_attacks,
-        in_war_attacks,
-        out_of_war_attacks,
-        ff_sum,
-        ff_count,
-        war_start,
-    )
+    st.last_ts = int(newest_ts)
+    st.last_attack_id = int(newest_id)
+    war_state_save(_db_conn, st)
+
+    return int(st.total), int(st.in_war), int(st.out_war), float(st.ff_sum), int(st.ff_count), int(war_start)
 
 
 async def scan_war_window_stats_for_user(torn_user_id: int) -> Tuple[int, int, int, float, int, int]:

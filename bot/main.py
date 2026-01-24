@@ -28,6 +28,9 @@ async def on_ready():
 def main():
     conn = db_init()
     client.db_conn = conn
+    from . import torn_api
+    torn_api.set_db_conn(client.db_conn)
+
     client.chain_watcher = ChainWatcher(client, conn, poll_seconds=15)
 
     register_all(client, tree)
