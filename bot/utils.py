@@ -3,7 +3,7 @@ from typing import Optional, List
 from urllib.parse import urlparse, parse_qs
 
 import discord
-from .config import VERIFIED_ROLE_NAME, LEADERSHIP_ROLE_NAMES
+from .config import VERIFIED_ROLE_NAME, LEADERSHIP_ROLES
 
 _TORN_ID_RE = re.compile(r"\[(\d{1,10})\]\s*$")
 
@@ -33,7 +33,7 @@ def is_leadership_member(interaction: discord.Interaction) -> bool:
     if not isinstance(member, discord.Member):
         return False
     role_names = {r.name for r in member.roles}
-    return any(rn in role_names for rn in (LEADERSHIP_ROLE_NAMES or []))
+    return any(rn in role_names for rn in (LEADERSHIP_ROLES or set()))
 
 
 def revive_enabled(setting: str) -> bool:
