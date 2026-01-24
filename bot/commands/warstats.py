@@ -10,6 +10,10 @@ from ..utils import (
 from ..torn_api import get_user_warstats, get_all_warstats
 
 
+def _fmt_ff(v) -> str:
+    return f"{v:.2f}" if v is not None else "n/a"
+
+
 def register(client, tree: app_commands.CommandTree):
 
     @tree.command(
@@ -42,23 +46,22 @@ def register(client, tree: app_commands.CommandTree):
 
             data = await get_user_warstats(int(torn_id))
 
-            ranked_ff = data.get("ranked_ff_avg")
-            total_ff = data.get("total_ff_avg")
-
-            ranked_ff_txt = f"{ranked_ff:.2f}" if ranked_ff is not None else "n/a"
-            total_ff_txt = f"{total_ff:.2f}" if total_ff is not None else "n/a"
+            ranked_ff_txt = _fmt_ff(data.get("ranked_ff_avg"))
+            other_ff_txt = _fmt_ff(data.get("other_ff_avg"))
+            total_ff_txt = _fmt_ff(data.get("total_ff_avg"))
 
             progress = (
                 "✅ backfill complete"
                 if int(data.get("is_initialized") or 0) == 1
-                else "⏳ still backfilling older pages"
+                else "⏳ still backfilling older pages, run command again"
             )
 
             await interaction.followup.send(
-                f"📊 **Your War Stats (won hits only)**\n"
-                f"- ⚔️ Ranked-war wins: **{int(data.get('ranked_wins') or 0):,}**\n"
-                f"- 🥊 Other wins: **{int(data.get('other_wins') or 0):,}**\n"
-                f"- 📈 Ranked FF avg: **{ranked_ff_txt}**\n"
+                f"📊 **Your War Stats:**\n"
+                f"- ⚔️ Total RW Hits: **{int(data.get('ranked_wins') or 0):,}**\n"
+                f"- 🥊 Total Outside Hits: **{int(data.get('other_wins') or 0):,}**\n"
+                f"- 📈 RW FF avg: **{ranked_ff_txt}**\n"
+                f"- 📊 Outside FF avg: **{other_ff_txt}**\n"
                 f"- 📉 Total FF avg: **{total_ff_txt}**\n"
                 f"- War start: <t:{int(data.get('war_start') or 0)}:f>\n"
                 f"- Status: {progress}"
@@ -72,7 +75,7 @@ def register(client, tree: app_commands.CommandTree):
 
     @tree.command(
         name="warstats_all",
-        description="(Leadership) Won-hit war stats for all members.",
+        description="(Leadership) War stats for all members.",
     )
     async def warstats_all(interaction: discord.Interaction):
         await interaction.response.defer(thinking=True, ephemeral=True)
@@ -94,37 +97,49 @@ def register(client, tree: app_commands.CommandTree):
             rows = data.get("rows") or []
 
             header = (
-                f"📊 **War Stats — All Members (won hits only)**\n"
+                f"📊 **War Stats — All Members**\n"
                 f"War start: <t:{int(data.get('war_start') or 0)}:f>\n"
-                f"{'✅ backfill complete' if int(data.get('is_initialized') or 0) == 1 else '⏳ still backfilling older pages'}\n\n"
+                f"{'✅ backfill complete' if int(data.get('is_initialized') or 0) == 1 else '⏳ still backfilling, run command again'}\n"
             )
 
             if not rows:
-                await interaction.followup.send(
-                    header + "No stats collected yet."
-                )
+                await interaction.followup.send(header + "\nNo stats collected yet.")
                 return
 
-            lines = []
+            # --- aligned monospace table ---
+            NAME_W = 22
+
+            table_lines = []
+            table_lines.append(
+                f"{'#':>3}  {'Name':<{NAME_W}}  {'RW':>5}  {'OUT':>5}  {'FF-RW':>6}  {'FF-OUT':>6}  {'FF-TOT':>6}"
+            )
+            table_lines.append(
+                f"{'-'*3}  {'-'*NAME_W}  {'-'*5}  {'-'*5}  {'-'*6}  {'-'*6}  {'-'*6}"
+            )
+
             for i, r in enumerate(rows, start=1):
-                ranked_ff = r.get("ranked_ff_avg")
-                total_ff = r.get("total_ff_avg")
+                name = (r.get("name") or f"[{r.get('torn_id')}]").strip()
+                if len(name) > NAME_W:
+                    name = name[:NAME_W - 1] + "…"
 
-                ranked_ff_txt = f"{ranked_ff:.2f}" if ranked_ff is not None else "n/a"
-                total_ff_txt = f"{total_ff:.2f}" if total_ff is not None else "n/a"
+                rw = int(r.get("ranked_wins") or 0)
+                ow = int(r.get("other_wins") or 0)
 
-                name = r.get("name") or f"[{r.get('torn_id')}]"
+                ff_rw = _fmt_ff(r.get("ranked_ff_avg"))
+                ff_out = _fmt_ff(r.get("other_ff_avg"))
+                ff_tot = _fmt_ff(r.get("total_ff_avg"))
 
-                lines.append(
-                    f"{i:>3}. {name} — "
-                    f"Ranked **{int(r.get('ranked_wins') or 0):,}**, "
-                    f"Other **{int(r.get('other_wins') or 0):,}**, "
-                    f"FF(ranked) **{ranked_ff_txt}**, "
-                    f"FF(total) **{total_ff_txt}**"
+                table_lines.append(
+                    f"{i:>3}  {name:<{NAME_W}}  {rw:>5}  {ow:>5}  {ff_rw:>6}  {ff_out:>6}  {ff_tot:>6}"
                 )
 
-            for msg in chunk_lines(header, lines, limit=1900):
-                await interaction.followup.send(msg)
+            # chunk while preserving code blocks
+            chunks = chunk_lines("", table_lines, limit=1800)
+            for idx, chunk in enumerate(chunks):
+                if idx == 0:
+                    await interaction.followup.send(header + "\n```text\n" + chunk + "\n```")
+                else:
+                    await interaction.followup.send("```text\n" + chunk + "\n```")
 
         except Exception as e:
             await interaction.followup.send(

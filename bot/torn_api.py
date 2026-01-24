@@ -368,11 +368,18 @@ async def get_user_warstats(torn_user_id: int) -> Dict[str, Any]:
     ranked_wins = int(agg["ranked_wins"])
     other_wins = int(agg["other_wins"])
 
+    ranked_ff_sum = float(agg["ranked_ff_sum"])
     ranked_ff_count = int(agg["ranked_ff_count"])
-    ranked_ff_avg = (float(agg["ranked_ff_sum"]) / ranked_ff_count) if ranked_ff_count > 0 else None
+    ranked_ff_avg = (ranked_ff_sum / ranked_ff_count) if ranked_ff_count > 0 else None
 
+    total_ff_sum = float(agg["total_ff_sum"])
     total_ff_count = int(agg["total_ff_count"])
-    total_ff_avg = (float(agg["total_ff_sum"]) / total_ff_count) if total_ff_count > 0 else None
+    total_ff_avg = (total_ff_sum / total_ff_count) if total_ff_count > 0 else None
+
+    # "Other" FF avg = total - ranked
+    other_ff_sum = total_ff_sum - ranked_ff_sum
+    other_ff_count = total_ff_count - ranked_ff_count
+    other_ff_avg = (other_ff_sum / other_ff_count) if other_ff_count > 0 else None
 
     st = war_global_get(_db_conn, war_start)
 
@@ -381,6 +388,7 @@ async def get_user_warstats(torn_user_id: int) -> Dict[str, Any]:
         "ranked_wins": ranked_wins,
         "other_wins": other_wins,
         "ranked_ff_avg": ranked_ff_avg,
+        "other_ff_avg": other_ff_avg,
         "total_ff_avg": total_ff_avg,
         "is_initialized": int(st.is_initialized) if st else 0,
         "backfill_to": int(st.backfill_to) if (st and st.backfill_to is not None) else None,
@@ -472,8 +480,18 @@ async def get_all_warstats() -> Dict[str, Any]:
     # decorate rows with name + averages
     out_rows: List[Dict[str, Any]] = []
     for r in rows:
-        ranked_ff_avg = (r["ranked_ff_sum"] / r["ranked_ff_count"]) if r["ranked_ff_count"] > 0 else None
-        total_ff_avg = (r["total_ff_sum"] / r["total_ff_count"]) if r["total_ff_count"] > 0 else None
+        ranked_ff_sum = float(r["ranked_ff_sum"])
+        ranked_ff_count = int(r["ranked_ff_count"])
+        ranked_ff_avg = (ranked_ff_sum / ranked_ff_count) if ranked_ff_count > 0 else None
+
+        total_ff_sum = float(r["total_ff_sum"])
+        total_ff_count = int(r["total_ff_count"])
+        total_ff_avg = (total_ff_sum / total_ff_count) if total_ff_count > 0 else None
+
+        other_ff_sum = total_ff_sum - ranked_ff_sum
+        other_ff_count = total_ff_count - ranked_ff_count
+        other_ff_avg = (other_ff_sum / other_ff_count) if other_ff_count > 0 else None
+
         tid = int(r["torn_id"])
         out_rows.append({
             "torn_id": tid,
@@ -481,6 +499,7 @@ async def get_all_warstats() -> Dict[str, Any]:
             "ranked_wins": int(r["ranked_wins"]),
             "other_wins": int(r["other_wins"]),
             "ranked_ff_avg": ranked_ff_avg,
+            "other_ff_avg": other_ff_avg,
             "total_ff_avg": total_ff_avg,
         })
 
