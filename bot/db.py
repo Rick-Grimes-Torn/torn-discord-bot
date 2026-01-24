@@ -20,8 +20,6 @@ def db_init() -> sqlite3.Connection:
     Open (and initialize) the SQLite database and return a connection
     intended to stay open for the bot's lifetime.
     """
-    # check_same_thread=False avoids occasional issues when tasks/callbacks
-    # touch the same connection from different execution contexts.
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
 
     # Better concurrency characteristics
@@ -51,15 +49,20 @@ def db_init() -> sqlite3.Connection:
         )
     """)
 
-    # War scan state table (checkpoint + rolling aggregates)
+    # War scan state (checkpoint + backfill cursor + rolling aggregates)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS war_scan_state (
-            mode TEXT NOT NULL,              -- 'ranked' or 'window'
+            mode TEXT NOT NULL,               -- 'ranked' or 'window'
             torn_id INTEGER NOT NULL,
             war_start INTEGER NOT NULL,
 
-            last_ts INTEGER NOT NULL,         -- last processed attack.started
-            last_attack_id INTEGER NOT NULL,  -- tie-breaker for identical timestamps
+            -- newest processed marker (post-initialization)
+            last_ts INTEGER NOT NULL,
+            last_attack_id INTEGER NOT NULL,
+
+            -- backfill cursor (pre-initialization)
+            backfill_to INTEGER,
+            is_initialized INTEGER NOT NULL DEFAULT 0,
 
             total INTEGER NOT NULL DEFAULT 0,
             in_war INTEGER NOT NULL DEFAULT 0,
@@ -73,12 +76,17 @@ def db_init() -> sqlite3.Connection:
         )
     """)
 
-    # One-time migration for older DBs that had war_scan_state without last_attack_id
-    try:
-        cur.execute("ALTER TABLE war_scan_state ADD COLUMN last_attack_id INTEGER NOT NULL DEFAULT 0;")
-    except sqlite3.OperationalError:
-        # Column already exists (or table created with it)
-        pass
+    # One-time migrations for older DBs (safe no-ops if already applied)
+    migrations = [
+        "ALTER TABLE war_scan_state ADD COLUMN last_attack_id INTEGER NOT NULL DEFAULT 0;",
+        "ALTER TABLE war_scan_state ADD COLUMN backfill_to INTEGER;",
+        "ALTER TABLE war_scan_state ADD COLUMN is_initialized INTEGER NOT NULL DEFAULT 0;",
+    ]
+    for stmt in migrations:
+        try:
+            cur.execute(stmt)
+        except sqlite3.OperationalError:
+            pass
 
     con.commit()
     return con
@@ -97,7 +105,7 @@ def decrypt_key(enc: bytes) -> str:
 
 
 # -----------------------------
-# WAR SCAN STATE (CHECKPOINTS)
+# WAR SCAN STATE
 # -----------------------------
 
 @dataclass
@@ -105,21 +113,33 @@ class WarScanState:
     mode: str
     torn_id: int
     war_start: int
+
     last_ts: int
     last_attack_id: int
+
+    backfill_to: Optional[int]
+    is_initialized: int
+
     total: int
     in_war: int
     out_war: int
+
     ff_sum: float
     ff_count: int
+
     updated_at: int
 
 
 def war_state_get(con: sqlite3.Connection, mode: str, torn_id: int) -> Optional[WarScanState]:
     cur = con.cursor()
     cur.execute("""
-        SELECT mode, torn_id, war_start, last_ts, last_attack_id,
-               total, in_war, out_war, ff_sum, ff_count, updated_at
+        SELECT
+            mode, torn_id, war_start,
+            last_ts, last_attack_id,
+            backfill_to, is_initialized,
+            total, in_war, out_war,
+            ff_sum, ff_count,
+            updated_at
         FROM war_scan_state
         WHERE mode = ? AND torn_id = ?
     """, (str(mode), int(torn_id)))
@@ -133,12 +153,14 @@ def war_state_get(con: sqlite3.Connection, mode: str, torn_id: int) -> Optional[
         war_start=int(row[2]),
         last_ts=int(row[3]),
         last_attack_id=int(row[4]),
-        total=int(row[5]),
-        in_war=int(row[6]),
-        out_war=int(row[7]),
-        ff_sum=float(row[8]),
-        ff_count=int(row[9]),
-        updated_at=int(row[10]),
+        backfill_to=(int(row[5]) if row[5] is not None else None),
+        is_initialized=int(row[6]),
+        total=int(row[7]),
+        in_war=int(row[8]),
+        out_war=int(row[9]),
+        ff_sum=float(row[10]),
+        ff_count=int(row[11]),
+        updated_at=int(row[12]),
     )
 
 
@@ -148,8 +170,15 @@ def war_state_reset(con: sqlite3.Connection, mode: str, torn_id: int, war_start:
         mode=str(mode),
         torn_id=int(torn_id),
         war_start=int(war_start),
+
+        # before init we don't rely on these, but keep sane defaults
         last_ts=int(war_start),
         last_attack_id=0,
+
+        # backfill begins from newest (NULL to= means newest page)
+        backfill_to=None,
+        is_initialized=0,
+
         total=0,
         in_war=0,
         out_war=0,
@@ -170,14 +199,20 @@ def _war_state_upsert(con: sqlite3.Connection, st: WarScanState) -> None:
     cur = con.cursor()
     cur.execute("""
         INSERT INTO war_scan_state (
-            mode, torn_id, war_start, last_ts, last_attack_id,
-            total, in_war, out_war, ff_sum, ff_count, updated_at
+            mode, torn_id, war_start,
+            last_ts, last_attack_id,
+            backfill_to, is_initialized,
+            total, in_war, out_war,
+            ff_sum, ff_count,
+            updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(mode, torn_id) DO UPDATE SET
             war_start=excluded.war_start,
             last_ts=excluded.last_ts,
             last_attack_id=excluded.last_attack_id,
+            backfill_to=excluded.backfill_to,
+            is_initialized=excluded.is_initialized,
             total=excluded.total,
             in_war=excluded.in_war,
             out_war=excluded.out_war,
@@ -185,8 +220,13 @@ def _war_state_upsert(con: sqlite3.Connection, st: WarScanState) -> None:
             ff_count=excluded.ff_count,
             updated_at=excluded.updated_at
     """, (
-        st.mode, int(st.torn_id), int(st.war_start), int(st.last_ts), int(st.last_attack_id),
-        int(st.total), int(st.in_war), int(st.out_war), float(st.ff_sum), int(st.ff_count), int(st.updated_at),
+        st.mode, int(st.torn_id), int(st.war_start),
+        int(st.last_ts), int(st.last_attack_id),
+        (int(st.backfill_to) if st.backfill_to is not None else None),
+        int(st.is_initialized),
+        int(st.total), int(st.in_war), int(st.out_war),
+        float(st.ff_sum), int(st.ff_count),
+        int(st.updated_at),
     ))
     con.commit()
 
