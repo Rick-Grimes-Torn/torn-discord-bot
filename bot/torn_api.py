@@ -478,3 +478,11 @@ async def get_all_warstats() -> Dict[str, Any]:
         "rows": out_rows,
         "is_initialized": int(st.is_initialized) if st else 0,
     }
+# -------------------------------------------------------------------
+# Backwards-compatible aliases for older command modules
+# -------------------------------------------------------------------
+
+# Older commands still expect these names.
+# They now all map to the unified incremental scanner.
+scan_ranked_war_stats_for_user = scan_faction_attacks_progress
+scan_war_window_stats_for_user = scan_faction_attacks_progress
