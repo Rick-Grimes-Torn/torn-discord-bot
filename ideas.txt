@@ -1,0 +1,19 @@
+Feature to add: leadership-configurable chain watcher settings + test ping
+
+Right now, chainstart() announces whatever client.chain_watcher thinks the ping role + threshold are, but leadership can’t change them from Discord.
+
+Add these commands:
+
+/chainconfig threshold <seconds> (leadership) — set alert threshold
+
+/chainconfig poll <seconds> (leadership) — set poll interval
+
+/chainconfig pingrole <role> (leadership) — set ping role used when alert fires
+
+/chainconfig channel (leadership) — set the watcher output channel (without restarting)
+
+/chaintest (leadership) — sends a single test alert ping into the configured channel (useful for permissions/role sanity)
+
+/chainwho — show how many users are opted into /pingme in this guild (public or ephemeral; I’ll do ephemeral)
+
+This is “configuration data”, not long-term stats/history, so persisting it in SQLite is totally consistent with your “no long-term retention” rule.

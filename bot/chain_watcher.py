@@ -9,6 +9,7 @@ import discord
 
 from . import torn_api
 from . import db
+from .targets import TargetPicker
 
 
 # -------------------------------------------------------------------
@@ -22,6 +23,10 @@ class ChainAlertConfig:
 
     # Who is eligible to be pinged
     ping_role_name: str = "Savior"
+
+    # Target link lines
+    msg_target_line: str = "🎯 Easy target: {url}"
+    msg_target_none: str = "🎯 Easy target: *(none available right now)*"
 
     # When to alert (seconds remaining). Live value from Torn: chain.timeout
     alert_seconds: int = 75
@@ -92,6 +97,7 @@ class ChainWatcher:
       - online, OR
       - opted-in via /pingme (even if offline)
     """
+
     def get_status_snapshot(self, guild_id: int) -> dict:
         """
         Returns a small, safe snapshot of watcher state for /chainstatus and /status.
@@ -117,6 +123,9 @@ class ChainWatcher:
 
         self._state_by_guild: dict[int, ChainWatcherState] = {}
         self._tasks: dict[int, asyncio.Task] = {}
+
+        # Pick “easy target” link for alerts (cached to avoid API spam)
+        self.target_picker = TargetPicker(cache_ttl_seconds=60)
 
     def _state(self, guild_id: int) -> ChainWatcherState:
         return self._state_by_guild.setdefault(guild_id, ChainWatcherState())
@@ -228,10 +237,23 @@ class ChainWatcher:
             )
             return
 
+        # Pick first available target (in configured order)
+        target = await self.target_picker.pick_first_available()
+        if target:
+            target_line = CFG.msg_target_line.format(url=target.url)
+        else:
+            err = getattr(self.target_picker, "last_error", None)
+            if err:
+                target_line = CFG.msg_target_none + f"\nℹ️ debug: `{err}`"
+            else:
+                target_line = CFG.msg_target_none
+
         await channel.send(
             CFG.msg_alert_header.format(
                 timeout=timeout, chain_id=chain_id, ping_role=CFG.ping_role_name
             )
+            + "\n"
+            + target_line
         )
 
         for chunk in chunk_mentions(sorted(ping_ids)):
