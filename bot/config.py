@@ -15,6 +15,12 @@ DB_PATH = "botdata.sqlite3"
 VERIFIED_ROLE_NAME = "Verified"
 LEADERSHIP_ROLES = {"Negan Saviors", "Lieutenant Saviors", "Soldier"}
 
+SHEET_BOT_DATA_CSV_URL = "https://docs.google.com/spreadsheets/d/1N84XYb1HsphSefm6K_wNwNpUqbQ41WnAV2ZpfYdYjsA/export?format=csv&gid=1601570346"
+
+ROSTER_CHECK_INTERVAL_SECONDS = 300  # 5 minutes
+ROSTER_GRACE_MINUTES = 0            # if you want "late after 5 min", set to 5
+ROSTER_ALERT_MIN_INTERVAL_SECONDS = 3600  # at most one alert per hour
+
 WAR_START_CACHE_TTL_SECONDS = 120
 USER_STATS_CACHE_TTL_SECONDS = 60
 

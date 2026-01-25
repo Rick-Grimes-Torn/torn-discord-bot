@@ -7,6 +7,7 @@ from .commands import register_all
 from .chain_watcher import ChainWatcher
 
 
+
 intents = discord.Intents.default()
 intents.members = True
 intents.presences = True
@@ -28,10 +29,18 @@ async def on_ready():
 def main():
     conn = db_init()
     client.db_conn = conn
+    from .db import ensure_roster_tables
+    ensure_roster_tables(conn)
+
     from . import torn_api
+    from bot.roster_monitor import RosterMonitor
     torn_api.set_db_conn(client.db_conn)
 
     client.chain_watcher = ChainWatcher(client, conn, poll_seconds=15)
+
+
+    client.roster_monitor = RosterMonitor(client, client.db_conn)
+
 
     register_all(client, tree)
     client.run(DISCORD_TOKEN)

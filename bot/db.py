@@ -42,6 +42,27 @@ def db_init() -> sqlite3.Connection:
         )
     """)
 
+def ensure_roster_tables(conn):
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS roster_hour (
+      guild_id INTEGER NOT NULL,
+      day TEXT NOT NULL,            -- YYYY-MM-DD (UTC)
+      start_hour INTEGER NOT NULL,  -- 0-23 (UTC)
+      slot INTEGER NOT NULL,        -- 1-3
+      name TEXT NOT NULL,
+
+      state TEXT NOT NULL DEFAULT 'pending',  -- pending|online|late|missed|unknown
+      first_seen_ts INTEGER,                  -- epoch seconds (UTC) when they first appeared online/idle
+      late_minutes INTEGER NOT NULL DEFAULT 0,
+
+      PRIMARY KEY (guild_id, day, start_hour, slot, name)
+    );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_roster_hour_lookup ON roster_hour(guild_id, day, start_hour);")
+    conn.commit()
+
+
     # Global faction scan state (one cursor per war_start)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS war_scan_global (
@@ -91,6 +112,97 @@ def encrypt_key(api_key: str) -> bytes:
 
 def decrypt_key(enc: bytes) -> str:
     return fernet.decrypt(enc).decode("utf-8")
+
+def roster_upsert_expected(conn, guild_id: int, day: str, start_hour: int, expected: list[tuple[int, str]]):
+    """
+    expected: list of (slot, name)
+    Inserts pending rows for this hour. Does not delete existing rows (keeps history).
+    """
+    cur = conn.cursor()
+    for slot, name in expected:
+        cur.execute("""
+        INSERT OR IGNORE INTO roster_hour(guild_id, day, start_hour, slot, name)
+        VALUES(?,?,?,?,?)
+        """, (guild_id, day, start_hour, slot, name))
+    conn.commit()
+
+def roster_mark_online(conn, guild_id: int, day: str, start_hour: int, slot: int, name: str, first_seen_ts: int, late_minutes: int):
+    cur = conn.cursor()
+    cur.execute("""
+    UPDATE roster_hour
+       SET state = CASE WHEN ? > 0 THEN 'late' ELSE 'online' END,
+           first_seen_ts = COALESCE(first_seen_ts, ?),
+           late_minutes = CASE WHEN late_minutes = 0 THEN ? ELSE late_minutes END
+     WHERE guild_id=? AND day=? AND start_hour=? AND slot=? AND name=?
+       AND state IN ('pending','unknown')
+    """, (late_minutes, first_seen_ts, late_minutes, guild_id, day, start_hour, slot, name))
+    conn.commit()
+
+def roster_mark_missed(conn, guild_id: int, day: str, start_hour: int):
+    cur = conn.cursor()
+    cur.execute("""
+    UPDATE roster_hour
+       SET state = 'missed'
+     WHERE guild_id=? AND day=? AND start_hour=?
+       AND state = 'pending'
+    """, (guild_id, day, start_hour))
+    conn.commit()
+
+def roster_mark_unknown(conn, guild_id: int, day: str, start_hour: int, slot: int, name: str):
+    cur = conn.cursor()
+    cur.execute("""
+    UPDATE roster_hour
+       SET state = 'unknown'
+     WHERE guild_id=? AND day=? AND start_hour=? AND slot=? AND name=?
+       AND state = 'pending'
+    """, (guild_id, day, start_hour, slot, name))
+    conn.commit()
+
+def roster_get_hour(conn, guild_id: int, day: str, start_hour: int):
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT slot, name, state, late_minutes, first_seen_ts
+      FROM roster_hour
+     WHERE guild_id=? AND day=? AND start_hour=?
+     ORDER BY slot ASC, name COLLATE NOCASE ASC
+    """, (guild_id, day, start_hour))
+    rows = cur.fetchall()
+    return [
+        {"slot": r[0], "name": r[1], "state": r[2], "late_minutes": r[3], "first_seen_ts": r[4]}
+        for r in rows
+    ]
+
+def roster_report(conn, guild_id: int, day_from: str | None = None, day_to: str | None = None):
+    """
+    Returns per-name totals: missed_count, late_count, total_late_minutes
+    Optional day range.
+    """
+    params = [guild_id]
+    where = "WHERE guild_id=?"
+    if day_from:
+        where += " AND day >= ?"
+        params.append(day_from)
+    if day_to:
+        where += " AND day <= ?"
+        params.append(day_to)
+
+    cur = conn.cursor()
+    cur.execute(f"""
+    SELECT name,
+           SUM(CASE WHEN state='missed' THEN 1 ELSE 0 END) AS missed,
+           SUM(CASE WHEN state='late' THEN 1 ELSE 0 END)   AS late,
+           SUM(CASE WHEN state='late' THEN late_minutes ELSE 0 END) AS late_minutes
+      FROM roster_hour
+      {where}
+     GROUP BY name
+     HAVING missed > 0 OR late > 0
+     ORDER BY missed DESC, late_minutes DESC, late DESC, name COLLATE NOCASE ASC
+    """, params)
+    rows = cur.fetchall()
+    return [
+        {"name": r[0], "missed": int(r[1] or 0), "late": int(r[2] or 0), "late_minutes": int(r[3] or 0)}
+        for r in rows
+    ]
 
 
 # -----------------------------

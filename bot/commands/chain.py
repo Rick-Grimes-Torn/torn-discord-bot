@@ -23,6 +23,7 @@ def register(client: discord.Client, tree: app_commands.CommandTree):
 
     @chain.command(name="start", description="Start watching the faction chain timer (leadership only).")
     async def start(interaction: discord.Interaction):
+
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             return await interaction.response.send_message("Guild-only command.", ephemeral=True)
 
@@ -40,6 +41,8 @@ def register(client: discord.Client, tree: app_commands.CommandTree):
                 )
 
         await client.chain_watcher.start(interaction.guild, interaction.channel, interaction.user.id)
+        client.roster_monitor.start()
+
 
         # PUBLIC announcement
         snap = client.chain_watcher.get_status_snapshot(interaction.guild.id)
@@ -57,6 +60,8 @@ def register(client: discord.Client, tree: app_commands.CommandTree):
             return await interaction.response.send_message("Only leadership can use this command.", ephemeral=True)
 
         await client.chain_watcher.stop(interaction.guild.id)
+        await client.roster_monitor.stop()
+
 
         # Reset /pingme opt-ins for this guild whenever monitoring stops
         cleared = chain_optin_clear_guild(client.db_conn, interaction.guild.id)
