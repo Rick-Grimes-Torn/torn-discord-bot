@@ -30,9 +30,6 @@ def db_init() -> sqlite3.Connection:
             api_key_enc BLOB NOT NULL,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL
-    con.commit()
-    return con
-
         )
     """)
 
@@ -44,6 +41,8 @@ def db_init() -> sqlite3.Connection:
             PRIMARY KEY (guild_id, user_id)
         )
     """)
+    con.commit()
+    return con
 
 def ensure_roster_tables(conn):
     cur = conn.cursor()
