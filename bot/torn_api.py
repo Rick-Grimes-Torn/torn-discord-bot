@@ -141,17 +141,45 @@ async def get_cached_ranked_war_start() -> int:
     cached_ts = _war_start_cache.get("ts")
     fetched_at = int(_war_start_cache.get("fetched_at") or 0)
 
+    # Fresh cache
     if cached_ts and (now - fetched_at) <= WAR_START_CACHE_TTL_SECONDS:
         return int(cached_ts)
 
-    wars = await fetch_faction_wars()
-    war_start = get_latest_ranked_war_start(wars)
-    if not war_start:
-        raise RuntimeError("Could not find latest ranked war start timestamp.")
+    war_start = None
+    try:
+        wars = await fetch_faction_wars()
+        war_start = get_latest_ranked_war_start(wars)
+    except Exception:
+        war_start = None
 
-    _war_start_cache["ts"] = int(war_start)
-    _war_start_cache["fetched_at"] = now
-    return int(war_start)
+    # If Torn reports an active ranked war, use it
+    if war_start:
+        _war_start_cache["ts"] = int(war_start)
+        _war_start_cache["fetched_at"] = now
+        return int(war_start)
+
+    # --- FALLBACKS ---
+    # 1) If we have *any* cached war_start, even if stale, keep using it
+    if cached_ts:
+        return int(cached_ts)
+
+    # 2) If we have DB history, use the latest war_start we've ever seen
+    if _db_conn is not None:
+        try:
+            cur = _db_conn.cursor()
+            cur.execute("SELECT MAX(war_start) FROM war_scan_global")
+            row = cur.fetchone()
+            if row and row[0]:
+                ws = int(row[0])
+                _war_start_cache["ts"] = ws
+                _war_start_cache["fetched_at"] = now
+                return ws
+        except Exception:
+            pass
+
+    raise RuntimeError(
+        "Could not find latest ranked war start timestamp (no active ranked war and no previous war cached)."
+    )
 
 
 # -------------------------------------------------------------------
