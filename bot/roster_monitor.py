@@ -10,13 +10,18 @@ import discord
 from bot import config, db, torn_api
 from bot.sheets_bot_data import fetch_bot_data_rows
 
+
 def _utc_day_hour(ts: int | None = None) -> tuple[str, int]:
     now = datetime.fromtimestamp(ts or time.time(), tz=timezone.utc)
     return now.strftime("%Y-%m-%d"), now.hour
 
+
 def _hour_start_ts(day: str, hour: int) -> int:
-    dt = datetime.strptime(f"{day} {hour:02d}:00:00", "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    dt = datetime.strptime(
+        f"{day} {hour:02d}:00:00", "%Y-%m-%d %H:%M:%S"
+    ).replace(tzinfo=timezone.utc)
     return int(dt.timestamp())
+
 
 def _is_online_like(last_action_status: str | None) -> bool:
     if not last_action_status:
@@ -24,8 +29,10 @@ def _is_online_like(last_action_status: str | None) -> bool:
     s = str(last_action_status).strip().lower()
     return s in {"online", "idle"}
 
+
 def _norm_name(s: str) -> str:
     return str(s or "").strip().lower()
+
 
 @dataclass
 class HourState:
@@ -33,6 +40,7 @@ class HourState:
     hour: int
     expected: list[tuple[int, str]]  # (slot, name)
     alerted: bool = False
+
 
 class RosterMonitor:
     def __init__(self, client: discord.Client, db_conn):
@@ -86,7 +94,9 @@ class RosterMonitor:
             if not hs or hs.day != day or hs.hour != hour:
                 # New hour: load BOT_DATA and seed expected list
                 expected = await self._get_expected_for_hour(day, hour)
-                self._hour_state_by_guild[guild.id] = HourState(day=day, hour=hour, expected=expected, alerted=False)
+                self._hour_state_by_guild[guild.id] = HourState(
+                    day=day, hour=hour, expected=expected, alerted=False
+                )
 
                 # write expected to DB
                 db.roster_upsert_expected(self.db_conn, guild.id, day, hour, expected)
@@ -111,18 +121,19 @@ class RosterMonitor:
             return  # no signups this hour => no alert
 
         # Fetch faction members once, build name->last_action.status
-        members_payload = await torn_api.fetch_faction_members()
-        members = (members_payload or {}).get("members") or {}
+        members = await torn_api.fetch_faction_members()
+        if not isinstance(members, list):
+            members = []
 
-        status_by_name = {}
-        for _mid, m in members.items():
+        status_by_name: dict[str, str | None] = {}
+        for m in members:
             name = m.get("name")
             la = (m.get("last_action") or {})
             status_by_name[_norm_name(name)] = la.get("status")
 
         # Determine who is online-like
-        online_like = []
-        offline_like = []
+        online_like: list[tuple[int, str]] = []
+        offline_like: list[tuple[int, str]] = []
 
         now_ts = int(time.time())
         hour_start = _hour_start_ts(hs.day, hs.hour)
@@ -141,7 +152,9 @@ class RosterMonitor:
                 late_minutes = max(0, int((now_ts - hour_start) // 60))
                 grace = int(config.ROSTER_GRACE_MINUTES)
                 late_minutes = max(0, late_minutes - grace)
-                db.roster_mark_online(self.db_conn, guild.id, hs.day, hs.hour, slot, name, now_ts, late_minutes)
+                db.roster_mark_online(
+                    self.db_conn, guild.id, hs.day, hs.hour, slot, name, now_ts, late_minutes
+                )
             else:
                 offline_like.append((slot, name))
 

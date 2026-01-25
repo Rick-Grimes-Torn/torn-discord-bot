@@ -27,10 +27,6 @@ def register(client: discord.Client, tree: app_commands.CommandTree):
         if not interaction.guild:
             return await interaction.followup.send("Guild-only command.")
 
-        # Leadership-only by default (change if you want it public)
-        if not is_leadership_member(interaction):
-            return await interaction.followup.send("This command is **leadership-only**.")
-
         day, hour = _utc_day_hour()
         rows = await fetch_bot_data_rows()
         expected = [(r.slot, r.name) for r in rows if r.day == day and r.start_hour == hour]
@@ -39,12 +35,14 @@ def register(client: discord.Client, tree: app_commands.CommandTree):
         if not expected:
             return await interaction.followup.send(f"🗓️ **Roster now (UTC):** {day} {hour:02d}:00\nNo signups for this hour.")
 
-        members_payload = await torn_api.fetch_faction_members()
-        members = (members_payload or {}).get("members") or {}
+        members = await torn_api.fetch_faction_members()
+        if not isinstance(members, list):
+            members = []
+
 
         status_by_name = {}
         rel_by_name = {}
-        for _mid, m in members.items():
+        for m in members:
             name = m.get("name")
             la = (m.get("last_action") or {})
             status_by_name[_norm(name)] = la.get("status")
