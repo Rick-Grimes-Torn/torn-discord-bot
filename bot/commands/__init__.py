@@ -5,12 +5,12 @@ from . import api_keys
 from . import balance
 from . import leader
 from . import help_cmd
-from . import chain_timer
 from . import negan
 from . import status_cmd
 from . import market
 from . import neganquote
 from . import warstats
+from . import chain
 
 
 
@@ -43,16 +43,16 @@ def _call_register(mod, client, tree):
 
 def register_all(client, tree):
     _call_register(faction, client, tree)
-#   _call_register(api_keys, client, tree)
+    _call_register(api_keys, client, tree)
     _call_register(balance, client, tree)
     _call_register(leader, client, tree)
     _call_register(help_cmd, client, tree)
     _call_register(negan, client, tree)
-#   _call_register(chain_timer, client, tree)
     _call_register(status_cmd, client, tree)
     _call_register(market, client, tree)
     _call_register(neganquote, client, tree)
     _call_register(warstats, client, tree)
+    _call_register(chain, client, tree)
 
 
 

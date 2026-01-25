@@ -94,7 +94,6 @@ class ChainWatcher:
     Polls Torn /faction/chain and pings when timeout <= CFG.alert_seconds.
 
     Pings only members with role CFG.ping_role_name who are:
-      - online, OR
       - opted-in via /pingme (even if offline)
     """
 
@@ -221,13 +220,16 @@ class ChainWatcher:
             if member.bot:
                 continue
 
-            # Must have the ping role
+            # Opt-in ONLY
+            if member.id not in opted_in_ids:
+                continue
+
+            # Still require the ping role (prevents pinging ex-members / role removals)
             if ping_role not in member.roles:
                 continue
 
-            # Online OR opted-in (even if offline)
-            if member.status != discord.Status.offline or member.id in opted_in_ids:
-                ping_ids.add(member.id)
+            ping_ids.add(member.id)
+
 
         if not ping_ids:
             await channel.send(
