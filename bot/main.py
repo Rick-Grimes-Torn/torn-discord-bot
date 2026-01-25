@@ -2,7 +2,7 @@ import discord
 from discord import app_commands
 
 from .config import DISCORD_TOKEN
-from bot.db import db_init
+from bot.db import db_init, ensure_roster_tables
 from .commands import register_all
 from .chain_watcher import ChainWatcher
 
