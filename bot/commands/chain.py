@@ -79,6 +79,42 @@ def register(client: discord.Client, tree: app_commands.CommandTree):
             ephemeral=True,
         )
 
+    @chain.command(name="list", description="Show who is opted-in to chain pings.")
+    async def list_optins(interaction: discord.Interaction):
+        if not interaction.guild:
+            return await interaction.response.send_message(
+                "Guild-only command.",
+                ephemeral=True,
+            )
+
+        opted_in_ids = db.chain_optin_list(client.db_conn, interaction.guild.id)
+
+        if not opted_in_ids:
+            return await interaction.response.send_message(
+                "📣 **Chain ping opt-ins:** (none yet)\n"
+                "Use `/chain pingme` to opt in."
+            )
+
+        mentions = [f"<@{uid}>" for uid in opted_in_ids]
+
+        header = f"📣 **Chain ping opt-ins** ({len(mentions)}):\n"
+        messages = []
+        current = header
+
+        for m in mentions:
+            add = m + " "
+            if len(current) + len(add) > 1900:
+                messages.append(current.rstrip())
+                current = ""
+            current += add
+
+        if current.strip():
+            messages.append(current.rstrip())
+
+        await interaction.response.send_message(messages[0])
+        for extra in messages[1:]:
+            await interaction.followup.send(extra)
+
     @chain.command(name="noping", description="Opt-out of chain pings.")
     async def noping(interaction: discord.Interaction):
         if not interaction.guild:
