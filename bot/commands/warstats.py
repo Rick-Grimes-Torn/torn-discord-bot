@@ -21,7 +21,7 @@ def register(client, tree: app_commands.CommandTree):
         description="Your won-hit war stats (ranked vs other + FF averages).",
     )
     async def warstats(interaction: discord.Interaction):
-        await interaction.response.defer(thinking=True, ephemeral=True)
+        await interaction.response.defer(thinking=True)
 
         try:
             if not is_verified_member(interaction):
@@ -137,9 +137,9 @@ def register(client, tree: app_commands.CommandTree):
             chunks = chunk_lines("", table_lines, limit=1800)
             for idx, chunk in enumerate(chunks):
                 if idx == 0:
-                    await interaction.followup.send(header + "\n```text\n" + chunk + "\n```")
+                    await interaction.followup.send(header + "\n```text\n" + chunk + "\n```", ephemeral=False)
                 else:
-                    await interaction.followup.send("```text\n" + chunk + "\n```")
+                    await interaction.followup.send("```text\n" + chunk + "\n```", ephemeral=False)
 
         except Exception as e:
             await interaction.followup.send(
