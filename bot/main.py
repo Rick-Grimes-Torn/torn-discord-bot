@@ -2,7 +2,7 @@ import discord
 from discord import app_commands
 
 from .config import DISCORD_TOKEN
-from .db import db_init
+from bot.db import db_init
 from .commands import register_all
 from .chain_watcher import ChainWatcher
 
@@ -28,9 +28,12 @@ async def on_ready():
 
 def main():
     conn = db_init()
+    if conn is None:
+        raise RuntimeError("db_init() returned None. Check DB path/config and permissions on the dev VPS.")
+
     client.db_conn = conn
-    from .db import ensure_roster_tables
     ensure_roster_tables(conn)
+
 
     from . import torn_api
     from bot.roster_monitor import RosterMonitor
