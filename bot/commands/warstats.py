@@ -97,7 +97,7 @@ def register(client, tree: app_commands.CommandTree):
             rows = data.get("rows") or []
 
             header = (
-                f"📊 **War Stats — All Members**\n"
+                f"📊 **War Stats — All Members**(v2026-01-25-1)\n"
                 f"War start: <t:{int(data.get('war_start') or 0)}:f>\n"
                 f"{'✅ backfill complete' if int(data.get('is_initialized') or 0) == 1 else '⏳ still backfilling, run command again'}\n"
             )
@@ -137,9 +137,9 @@ def register(client, tree: app_commands.CommandTree):
             chunks = chunk_lines("", table_lines, limit=1800)
             for idx, chunk in enumerate(chunks):
                 if idx == 0:
-                    await interaction.followup.send(header + "\n```text\n" + chunk + "\n```", ephemeral=False)
+                    await interaction.followup.send(header + "\n```text\n" + chunk + "\n```")
                 else:
-                    await interaction.followup.send("```text\n" + chunk + "\n```", ephemeral=False)
+                    await interaction.followup.send("```text\n" + chunk + "\n```")
 
         except Exception as e:
             await interaction.followup.send(
