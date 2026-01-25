@@ -78,7 +78,7 @@ def register(client, tree: app_commands.CommandTree):
         description="(Leadership) War stats for all members.",
     )
     async def warstats_all(interaction: discord.Interaction):
-        await interaction.response.defer(thinking=True, ephemeral=True)
+        await interaction.response.defer(thinking=True)
 
         try:
             if not is_verified_member(interaction):
