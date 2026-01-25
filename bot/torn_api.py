@@ -239,12 +239,26 @@ async def scan_faction_attacks_progress(
                 new_cursor_ts, new_cursor_id = started, attack_id_i
 
             # won-only: respect_gain > 0
+            # Include only valid "hit" outcomes:
+            # - Exclude escapes, stalemates, losses
+            # - Count if respect_gain > 0 OR it's a raid hit (raid often has 0 respect)
+            result = a.get("result")
+            if not isinstance(result, str):
+                continue
+            res = result.strip().lower()
+            if res in {"escape", "stalemate", "lost"}:
+                continue
+
+            is_raid = bool(a.get("is_raid", False))
+
             rg = a.get("respect_gain")
             try:
                 rgf = float(rg)
             except Exception:
                 rgf = 0.0
-            if rgf <= 0:
+
+            # raid hits count even if respect is 0; otherwise require positive respect
+            if rgf <= 0 and not is_raid:
                 continue
 
             attacker = a.get("attacker") or {}
@@ -253,8 +267,8 @@ async def scan_faction_attacks_progress(
                 continue
 
             modifiers = a.get("modifiers") or {}
-            war_mod = _safe_int0(modifiers.get("war"))
-            is_ranked = (war_mod == 2) or bool(a.get("is_ranked_war", False))
+            is_ranked = bool(a.get("is_ranked_war", False))
+
 
             ff = _safe_float(modifiers.get("fair_fight"))
 
@@ -306,13 +320,26 @@ async def scan_faction_attacks_progress(
                     stop = True
                     break
 
-                # won-only
+                # Include only valid "hit" outcomes:
+                # - Exclude escapes, stalemates, losses
+                # - Count if respect_gain > 0 OR it's a raid hit (raid often has 0 respect)
+                result = a.get("result")
+                if not isinstance(result, str):
+                    continue
+                res = result.strip().lower()
+                if res in {"escape", "stalemate", "lost"}:
+                    continue
+
+                is_raid = bool(a.get("is_raid", False))
+
                 try:
                     rgf = float(a.get("respect_gain") or 0)
                 except Exception:
                     rgf = 0.0
-                if rgf <= 0:
+
+                if rgf <= 0 and not is_raid:
                     continue
+
 
                 attacker = a.get("attacker") or {}
                 attacker_id = _safe_int0(attacker.get("id"))
@@ -320,8 +347,8 @@ async def scan_faction_attacks_progress(
                     continue
 
                 modifiers = a.get("modifiers") or {}
-                war_mod = _safe_int0(modifiers.get("war"))
-                is_ranked = (war_mod == 2) or bool(a.get("is_ranked_war", False))
+                is_ranked = bool(a.get("is_ranked_war", False))
+
                 ff = _safe_float(modifiers.get("fair_fight"))
 
                 war_agg_apply(_db_conn, war_start, attacker_id, is_ranked, ff)
