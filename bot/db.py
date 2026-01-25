@@ -62,7 +62,6 @@ def ensure_roster_tables(conn):
     );
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_roster_hour_lookup ON roster_hour(guild_id, day, start_hour);")
-    conn.commit()
 
 
     # Global faction scan state (one cursor per war_start)
@@ -100,8 +99,7 @@ def ensure_roster_tables(conn):
         )
     """)
 
-    con.commit()
-    return con
+    conn.commit()
 
 
 # -----------------------------
