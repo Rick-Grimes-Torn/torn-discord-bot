@@ -260,6 +260,11 @@ async def scan_faction_attacks_progress(
     """
     Progress the global scan.
     Returns: (is_initialized, pages_scanned_estimate)
+
+    Notes:
+      - We de-duplicate by attack ID within this scan run to avoid inclusive/exclusive
+        pagination boundary differences causing double-counts.
+      - Cursor boundary check still prevents reprocessing across runs.
     """
     async with _scan_lock:
         if _db_conn is None:
@@ -272,6 +277,9 @@ async def scan_faction_attacks_progress(
             st = war_global_reset(_db_conn, war_start)
 
         pages_scanned = 0
+
+        # De-dupe within this scan invocation (protects page boundary duplicates)
+        seen_attack_ids: set[int] = set()
 
         # -------------------------
         # HEAD SCAN (newest hits)
@@ -298,6 +306,13 @@ async def scan_faction_attacks_progress(
                     continue
 
                 attack_id_i = _safe_int0(a.get("id"))
+                if attack_id_i <= 0:
+                    continue
+
+                # de-dupe across pages in this invocation
+                if attack_id_i in seen_attack_ids:
+                    continue
+                seen_attack_ids.add(attack_id_i)
 
                 # Stop at already-processed boundary
                 if (started < st.last_ts) or (started == st.last_ts and attack_id_i <= st.last_attack_id):
@@ -355,7 +370,7 @@ async def scan_faction_attacks_progress(
             if to_next is None:
                 break
 
-            # IMPORTANT: do not subtract 1; rely on cursor boundary to avoid duplicates
+            # Use API-provided pagination marker; de-dupe handles boundary duplicates
             to_val = int(to_next)
 
         st.last_ts = int(new_cursor_ts)
@@ -393,6 +408,15 @@ async def scan_faction_attacks_progress(
                     if started < war_start:
                         stop = True
                         break
+
+                    attack_id_i = _safe_int0(a.get("id"))
+                    if attack_id_i <= 0:
+                        continue
+
+                    # de-dupe across pages in this invocation
+                    if attack_id_i in seen_attack_ids:
+                        continue
+                    seen_attack_ids.add(attack_id_i)
 
                     outcome = _norm_outcome(a.get("result"))
 
@@ -442,7 +466,6 @@ async def scan_faction_attacks_progress(
                     st.backfill_to = None
                     break
 
-                # IMPORTANT: do not subtract 1; rely on cursor boundary
                 st.backfill_to = int(next_to)
                 to_val = int(next_to)
 
