@@ -352,7 +352,7 @@ async def scan_faction_attacks_progress(
             break
 
         # Pagination should be exclusive to avoid duplicating the boundary item
-        to_val = max(int(to_next) - 1, 0)
+        to_val = int(to_next)
 
     st.last_ts = int(new_cursor_ts)
     st.last_attack_id = int(new_cursor_id)
@@ -439,9 +439,8 @@ async def scan_faction_attacks_progress(
                 st.backfill_to = None
                 break
 
-            next_to_excl = max(int(next_to) - 1, 0)
-            st.backfill_to = int(next_to_excl)
-            to_val = int(next_to_excl)
+            st.backfill_to = int(next_to)
+            to_val = int(next_to)
 
     # ✅ Persist scan state (CRITICAL)
     war_global_save(_db_conn, st)
@@ -463,7 +462,7 @@ async def get_user_warstats(torn_user_id: int) -> Dict[str, Any]:
     war_start = await get_cached_ranked_war_start()
 
     # keep data fresh
-    await scan_faction_attacks_progress(pages_head=1, pages_backfill=2)
+    await scan_faction_attacks_progress(pages_head=2, pages_backfill=25)
 
     ranked = war_bucket_get(_db_conn, war_start, int(torn_user_id), "ranked")
     outside = war_bucket_get(_db_conn, war_start, int(torn_user_id), "outside")
@@ -507,7 +506,7 @@ async def get_user_war_outcomes(torn_user_id: int) -> Dict[str, Any]:
         raise RuntimeError("DB connection not set in torn_api (set_db_conn not called).")
 
     war_start = await get_cached_ranked_war_start()
-    await scan_faction_attacks_progress(pages_head=1, pages_backfill=2)
+    await scan_faction_attacks_progress(pages_head=2, pages_backfill=25)
 
     return {
         "war_start": int(war_start),
@@ -524,7 +523,7 @@ async def get_all_warstats() -> Dict[str, Any]:
         raise RuntimeError("DB connection not set in torn_api (set_db_conn not called).")
 
     war_start = await get_cached_ranked_war_start()
-    await scan_faction_attacks_progress(pages_head=1, pages_backfill=3)
+    await scan_faction_attacks_progress(pages_head=2, pages_backfill=25)
 
     rows = war_bucket_list_all(_db_conn, war_start)
     st = war_global_get(_db_conn, war_start)
@@ -614,7 +613,7 @@ async def get_all_war_outcomes() -> Dict[str, Any]:
         raise RuntimeError("DB connection not set in torn_api (set_db_conn not called).")
 
     war_start = await get_cached_ranked_war_start()
-    await scan_faction_attacks_progress(pages_head=1, pages_backfill=3)
+    await scan_faction_attacks_progress(pages_head=2, pages_backfill=25)
 
     rows = war_outcome_list_all(_db_conn, war_start)
     name_map = await get_member_name_map()
