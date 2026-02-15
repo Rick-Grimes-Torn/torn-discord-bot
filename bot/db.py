@@ -78,6 +78,15 @@ def ensure_roster_tables(conn):
             updated_at INTEGER NOT NULL
         )
     """)
+    # Per-war processed attack IDs (dedupe across runs/restarts)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS war_processed_attack (
+            war_start INTEGER NOT NULL,
+            attack_id INTEGER NOT NULL,
+            PRIMARY KEY (war_start, attack_id)
+        )
+    """)
+
 
     # Per-user rolling aggregates (won-only)
     cur.execute("""
@@ -289,6 +298,19 @@ def war_outcome_list_all(con, war_start: int) -> list[dict]:
             "count": int(cnt or 0),
         })
     return rows
+
+def war_processed_try_mark(con: sqlite3.Connection, war_start: int, attack_id: int) -> bool:
+    """
+    Returns True if this (war_start, attack_id) was newly inserted (not processed before).
+    Returns False if it already existed (already processed).
+    """
+    cur = con.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO war_processed_attack (war_start, attack_id) VALUES (?, ?)",
+        (int(war_start), int(attack_id)),
+    )
+    return cur.rowcount == 1
+
 
 
 def war_bucket_apply(

@@ -22,6 +22,7 @@ from .db import (
     war_bucket_list_all,
     war_outcome_get_user,
     war_outcome_list_all,
+    war_processed_try_mark,
 )
 
 # ----------------------------
@@ -40,7 +41,6 @@ def set_db_conn(con: sqlite3.Connection) -> None:
 # Outcome model
 # ----------------------------
 
-# Outcomes we recognize and store exactly (lowercase)
 KNOWN_OUTCOMES = {
     "attacked",
     "lost",
@@ -49,10 +49,9 @@ KNOWN_OUTCOMES = {
     "assist",
     "stalemate",
     "hospitalized",
-    "leave",  # included because you said leave should count
+    "leave",
 }
 
-# Outcomes that count as an "attack" for totals/FF averages
 COUNTED_ATTACK_OUTCOMES = {
     "attacked",
     "mugged",
@@ -217,7 +216,7 @@ async def get_cached_ranked_war_start() -> int:
 
 
 # -------------------------------------------------------------------
-# Member name lookup (leadership list prettiness)
+# Member name lookup (leaderboard prettiness)
 # -------------------------------------------------------------------
 async def get_member_name_map(ttl_seconds: int = 300) -> Dict[int, str]:
     now = int(time.time())
@@ -244,7 +243,6 @@ async def get_member_name_map(ttl_seconds: int = 300) -> Dict[int, str]:
 # Scan mode (fast-fill until initialized, then normal)
 # -------------------------------------------------------------------
 def _scan_params_for_state(st) -> Tuple[int, int]:
-    # When still backfilling, go faster. Once initialized, keep it light.
     if st is not None and int(getattr(st, "is_initialized", 0)) == 0:
         return 2, 25
     return 1, 2
@@ -261,10 +259,11 @@ async def scan_faction_attacks_progress(
     Progress the global scan.
     Returns: (is_initialized, pages_scanned_estimate)
 
-    Notes:
-      - We de-duplicate by attack ID within this scan run to avoid inclusive/exclusive
-        pagination boundary differences causing double-counts.
-      - Cursor boundary check still prevents reprocessing across runs.
+    Safety:
+      - global async lock prevents concurrent overlapping scans
+      - per-scan seen_attack_ids prevents boundary duplicates within an invocation
+      - persistent war_processed_attack prevents duplicates across runs/restarts
+      - cursor boundary (ts + id) prevents reprocessing newer window across runs
     """
     async with _scan_lock:
         if _db_conn is None:
@@ -278,7 +277,6 @@ async def scan_faction_attacks_progress(
 
         pages_scanned = 0
 
-        # De-dupe within this scan invocation (protects page boundary duplicates)
         seen_attack_ids: set[int] = set()
 
         # -------------------------
@@ -309,10 +307,14 @@ async def scan_faction_attacks_progress(
                 if attack_id_i <= 0:
                     continue
 
-                # de-dupe across pages in this invocation
+                # per-invocation dedupe
                 if attack_id_i in seen_attack_ids:
                     continue
                 seen_attack_ids.add(attack_id_i)
+
+                # persistent dedupe (across runs/restarts)
+                if not war_processed_try_mark(_db_conn, war_start, attack_id_i):
+                    continue
 
                 # Stop at already-processed boundary
                 if (started < st.last_ts) or (started == st.last_ts and attack_id_i <= st.last_attack_id):
@@ -370,7 +372,6 @@ async def scan_faction_attacks_progress(
             if to_next is None:
                 break
 
-            # Use API-provided pagination marker; de-dupe handles boundary duplicates
             to_val = int(to_next)
 
         st.last_ts = int(new_cursor_ts)
@@ -413,10 +414,14 @@ async def scan_faction_attacks_progress(
                     if attack_id_i <= 0:
                         continue
 
-                    # de-dupe across pages in this invocation
+                    # per-invocation dedupe
                     if attack_id_i in seen_attack_ids:
                         continue
                     seen_attack_ids.add(attack_id_i)
+
+                    # persistent dedupe (across runs/restarts)
+                    if not war_processed_try_mark(_db_conn, war_start, attack_id_i):
+                        continue
 
                     outcome = _norm_outcome(a.get("result"))
 
@@ -715,8 +720,6 @@ def parse_active_chain(payload: dict) -> Optional[dict]:
     return out2
 
 
-# -------------------------------------------------------------------
-# Backwards-compatible aliases for older command modules
-# -------------------------------------------------------------------
+# Backwards-compatible aliases
 scan_ranked_war_stats_for_user = scan_faction_attacks_progress
 scan_war_window_stats_for_user = scan_faction_attacks_progress
