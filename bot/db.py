@@ -99,6 +99,40 @@ def ensure_roster_tables(conn):
         )
     """)
 
+    # Outcome counts per user, per bucket (ranked/outside), per result string
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS war_user_outcome (
+            war_start INTEGER NOT NULL,
+            torn_id INTEGER NOT NULL,
+            bucket TEXT NOT NULL,      -- 'ranked' | 'outside'
+            outcome TEXT NOT NULL,     -- normalized result (lowercase)
+            count INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (war_start, torn_id, bucket, outcome)
+        )
+    """)
+
+    # Per-user bucket totals + FF aggregates (for "counted hits")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS war_user_bucket (
+            war_start INTEGER NOT NULL,
+            torn_id INTEGER NOT NULL,
+            bucket TEXT NOT NULL,      -- 'ranked' | 'outside'
+
+            hits_total INTEGER NOT NULL DEFAULT 0,
+
+            ff_sum REAL NOT NULL DEFAULT 0,
+            ff_count INTEGER NOT NULL DEFAULT 0,
+
+            respect_gain_sum REAL NOT NULL DEFAULT 0,
+            respect_loss_sum REAL NOT NULL DEFAULT 0,
+
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (war_start, torn_id, bucket)
+        )
+    """)
+
+
     conn.commit()
 
 
@@ -203,6 +237,135 @@ def roster_report(conn, guild_id: int, day_from: str | None = None, day_to: str 
         {"name": r[0], "missed": int(r[1] or 0), "late": int(r[2] or 0), "late_minutes": int(r[3] or 0)}
         for r in rows
     ]
+
+def war_outcome_apply(con, war_start: int, torn_id: int, bucket: str, outcome: str) -> None:
+    now = int(time.time())
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO war_user_outcome (war_start, torn_id, bucket, outcome, count, updated_at)
+        VALUES (?, ?, ?, ?, 1, ?)
+        ON CONFLICT(war_start, torn_id, bucket, outcome) DO UPDATE SET
+            count = count + 1,
+            updated_at = excluded.updated_at
+    """, (int(war_start), int(torn_id), str(bucket), str(outcome), now))
+    con.commit()
+def war_outcome_get_user(con, war_start: int, torn_id: int) -> dict:
+    """
+    Returns { bucket: { outcome: count } } for a user.
+    """
+    cur = con.cursor()
+    cur.execute("""
+        SELECT bucket, outcome, count
+          FROM war_user_outcome
+         WHERE war_start=? AND torn_id=?
+    """, (int(war_start), int(torn_id)))
+
+    out: dict[str, dict[str, int]] = {}
+    for bucket, outcome, cnt in cur.fetchall():
+        b = str(bucket)
+        o = str(outcome)
+        c = int(cnt or 0)
+        out.setdefault(b, {})[o] = c
+    return out
+
+
+def war_outcome_list_all(con, war_start: int) -> list[dict]:
+    """
+    Returns rows: {torn_id, bucket, outcome, count}
+    """
+    cur = con.cursor()
+    cur.execute("""
+        SELECT torn_id, bucket, outcome, count
+          FROM war_user_outcome
+         WHERE war_start=?
+    """, (int(war_start),))
+
+    rows = []
+    for tid, bucket, outcome, cnt in cur.fetchall():
+        rows.append({
+            "torn_id": int(tid),
+            "bucket": str(bucket),
+            "outcome": str(outcome),
+            "count": int(cnt or 0),
+        })
+    return rows
+
+
+def war_bucket_apply(
+    con, war_start: int, torn_id: int, bucket: str,
+    ff_value: float | None,
+    respect_gain: float,
+    respect_loss: float
+) -> None:
+    now = int(time.time())
+    ff_sum_inc = float(ff_value) if ff_value is not None else 0.0
+    ff_count_inc = 1 if ff_value is not None else 0
+
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO war_user_bucket (
+            war_start, torn_id, bucket,
+            hits_total,
+            ff_sum, ff_count,
+            respect_gain_sum, respect_loss_sum,
+            updated_at
+        )
+        VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)
+        ON CONFLICT(war_start, torn_id, bucket) DO UPDATE SET
+            hits_total = hits_total + 1,
+            ff_sum = ff_sum + excluded.ff_sum,
+            ff_count = ff_count + excluded.ff_count,
+            respect_gain_sum = respect_gain_sum + excluded.respect_gain_sum,
+            respect_loss_sum = respect_loss_sum + excluded.respect_loss_sum,
+            updated_at = excluded.updated_at
+    """, (
+        int(war_start), int(torn_id), str(bucket),
+        ff_sum_inc, ff_count_inc,
+        float(respect_gain), float(respect_loss),
+        now
+    ))
+    con.commit()
+
+
+def war_bucket_get(con, war_start: int, torn_id: int, bucket: str) -> dict:
+    cur = con.cursor()
+    cur.execute("""
+        SELECT hits_total, ff_sum, ff_count, respect_gain_sum, respect_loss_sum
+        FROM war_user_bucket
+        WHERE war_start=? AND torn_id=? AND bucket=?
+    """, (int(war_start), int(torn_id), str(bucket)))
+    row = cur.fetchone()
+    if not row:
+        return {"hits_total": 0, "ff_sum": 0.0, "ff_count": 0, "respect_gain_sum": 0.0, "respect_loss_sum": 0.0}
+    return {
+        "hits_total": int(row[0]),
+        "ff_sum": float(row[1]),
+        "ff_count": int(row[2]),
+        "respect_gain_sum": float(row[3]),
+        "respect_loss_sum": float(row[4]),
+    }
+
+
+def war_bucket_list_all(con, war_start: int) -> list[dict]:
+    cur = con.cursor()
+    cur.execute("""
+        SELECT torn_id, bucket, hits_total, ff_sum, ff_count, respect_gain_sum, respect_loss_sum
+        FROM war_user_bucket
+        WHERE war_start=?
+    """, (int(war_start),))
+    out = []
+    for r in cur.fetchall():
+        out.append({
+            "torn_id": int(r[0]),
+            "bucket": str(r[1]),
+            "hits_total": int(r[2]),
+            "ff_sum": float(r[3]),
+            "ff_count": int(r[4]),
+            "respect_gain_sum": float(r[5]),
+            "respect_loss_sum": float(r[6]),
+        })
+    return out
+
 
 
 # -----------------------------

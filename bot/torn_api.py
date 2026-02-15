@@ -1,5 +1,4 @@
 import time
-import asyncio
 from typing import Optional, List, Tuple, Dict, Any
 
 import aiohttp
@@ -13,10 +12,16 @@ from .config import (
 )
 from .utils import extract_to_from_prev_url
 from .db import (
-    war_global_get, war_global_reset, war_global_save,
-    war_agg_apply, war_agg_get, war_agg_list_all
+    war_global_get,
+    war_global_reset,
+    war_global_save,
+    war_outcome_apply,
+    war_bucket_apply,
+    war_bucket_get,
+    war_bucket_list_all,
+    war_outcome_get_user,
+    war_outcome_list_all,
 )
-
 
 # ----------------------------
 # DB connection injected from main.py
@@ -27,6 +32,38 @@ _db_conn: Optional[sqlite3.Connection] = None
 def set_db_conn(con: sqlite3.Connection) -> None:
     global _db_conn
     _db_conn = con
+
+
+# ----------------------------
+# Outcome model
+# ----------------------------
+
+# Outcomes we recognize and store exactly (lowercase)
+KNOWN_OUTCOMES = {
+    "attacked",
+    "lost",
+    "mugged",
+    "interrupted",
+    "assist",
+    "stalemate",
+    "hospitalized",
+    "leave",  # keep included as you requested
+}
+
+# Outcomes that count as an "attack" for totals/FF averages
+COUNTED_ATTACK_OUTCOMES = {
+    "attacked",
+    "mugged",
+    "hospitalized",
+    "leave",
+}
+
+
+def _norm_outcome(v) -> str:
+    if not isinstance(v, str) or not v.strip():
+        return "unknown"
+    o = v.strip().lower()
+    return o if o in KNOWN_OUTCOMES else "other"
 
 
 # -------------------------------------------------------------------
@@ -159,7 +196,7 @@ async def get_cached_ranked_war_start() -> int:
         return int(war_start)
 
     # --- FALLBACKS ---
-    # 1) If we have *any* cached war_start, even if stale, keep using it
+    # 1) If we have any cached war_start (even stale), keep using it
     if cached_ts:
         return int(cached_ts)
 
@@ -238,6 +275,7 @@ async def scan_faction_attacks_progress(
     for _ in range(pages_head):
         page = await fetch_faction_attacks_outgoing(limit=100, to=to_val)
         pages_scanned += 1
+
         attacks = page.get("attacks", [])
         if not isinstance(attacks, list) or not attacks:
             break
@@ -253,7 +291,7 @@ async def scan_faction_attacks_progress(
 
             attack_id_i = _safe_int0(a.get("id"))
 
-            # stop when we reach already processed boundary
+            # Stop at already-processed boundary
             if (started < st.last_ts) or (started == st.last_ts and attack_id_i <= st.last_attack_id):
                 stop = True
                 break
@@ -266,41 +304,44 @@ async def scan_faction_attacks_progress(
             if (started > new_cursor_ts) or (started == new_cursor_ts and attack_id_i > new_cursor_id):
                 new_cursor_ts, new_cursor_id = started, attack_id_i
 
-            # won-only: respect_gain > 0
-            # Include only valid "hit" outcomes:
-            # - Exclude escapes, stalemates, losses
-            # - Count if respect_gain > 0 OR it's a raid hit (raid often has 0 respect)
-            result = a.get("result")
-            if not isinstance(result, str):
-                continue
-            res = result.strip().lower()
-            if res in {"escape", "stalemate", "lost"}:
-                continue
-
-            is_raid = bool(a.get("is_raid", False))
-
-            rg = a.get("respect_gain")
-            try:
-                rgf = float(rg)
-            except Exception:
-                rgf = 0.0
-
-            # raid hits count even if respect is 0; otherwise require positive respect
-            if rgf <= 0 and not is_raid:
-                continue
+            # --- Outcome-based model ---
+            outcome = _norm_outcome(a.get("result"))
 
             attacker = a.get("attacker") or {}
             attacker_id = _safe_int0(attacker.get("id"))
             if attacker_id <= 0:
                 continue
 
-            modifiers = a.get("modifiers") or {}
             is_ranked = bool(a.get("is_ranked_war", False))
+            bucket = "ranked" if is_ranked else "outside"
 
+            # Always track the outcome
+            war_outcome_apply(_db_conn, war_start, attacker_id, bucket, outcome)
 
-            ff = _safe_float(modifiers.get("fair_fight"))
+            # Only some outcomes count as "attacks"
+            if outcome in COUNTED_ATTACK_OUTCOMES:
+                modifiers = a.get("modifiers") or {}
+                ff = _safe_float(modifiers.get("fair_fight"))
 
-            war_agg_apply(_db_conn, war_start, attacker_id, is_ranked, ff)
+                try:
+                    respect_gain = float(a.get("respect_gain") or 0)
+                except Exception:
+                    respect_gain = 0.0
+
+                try:
+                    respect_loss = float(a.get("respect_loss") or 0)
+                except Exception:
+                    respect_loss = 0.0
+
+                war_bucket_apply(
+                    _db_conn,
+                    war_start,
+                    attacker_id,
+                    bucket,
+                    ff,
+                    respect_gain,
+                    respect_loss,
+                )
 
         if stop:
             break
@@ -310,13 +351,13 @@ async def scan_faction_attacks_progress(
         if to_next is None:
             break
 
-        # IMPORTANT: make pagination exclusive to avoid duplicating the boundary item
+        # Pagination should be exclusive to avoid duplicating the boundary item
         to_val = max(int(to_next) - 1, 0)
 
     st.last_ts = int(new_cursor_ts)
     st.last_attack_id = int(new_cursor_id)
 
-    # initialize backfill cursor once so we don't keep re-reading newest pages
+    # Initialize backfill cursor once
     if st.is_initialized == 0 and st.backfill_to is None:
         st.backfill_to = int(to_val) if to_val is not None else None
 
@@ -329,6 +370,7 @@ async def scan_faction_attacks_progress(
         for _ in range(pages_backfill):
             page = await fetch_faction_attacks_outgoing(limit=100, to=to_val)
             pages_scanned += 1
+
             attacks = page.get("attacks", [])
             if not isinstance(attacks, list) or not attacks:
                 st.is_initialized = 1
@@ -348,38 +390,42 @@ async def scan_faction_attacks_progress(
                     stop = True
                     break
 
-                # Include only valid "hit" outcomes:
-                # - Exclude escapes, stalemates, losses
-                # - Count if respect_gain > 0 OR it's a raid hit (raid often has 0 respect)
-                result = a.get("result")
-                if not isinstance(result, str):
-                    continue
-                res = result.strip().lower()
-                if res in {"escape", "stalemate", "lost"}:
-                    continue
-
-                is_raid = bool(a.get("is_raid", False))
-
-                try:
-                    rgf = float(a.get("respect_gain") or 0)
-                except Exception:
-                    rgf = 0.0
-
-                if rgf <= 0 and not is_raid:
-                    continue
-
+                # --- Outcome-based model ---
+                outcome = _norm_outcome(a.get("result"))
 
                 attacker = a.get("attacker") or {}
                 attacker_id = _safe_int0(attacker.get("id"))
                 if attacker_id <= 0:
                     continue
 
-                modifiers = a.get("modifiers") or {}
                 is_ranked = bool(a.get("is_ranked_war", False))
+                bucket = "ranked" if is_ranked else "outside"
 
-                ff = _safe_float(modifiers.get("fair_fight"))
+                war_outcome_apply(_db_conn, war_start, attacker_id, bucket, outcome)
 
-                war_agg_apply(_db_conn, war_start, attacker_id, is_ranked, ff)
+                if outcome in COUNTED_ATTACK_OUTCOMES:
+                    modifiers = a.get("modifiers") or {}
+                    ff = _safe_float(modifiers.get("fair_fight"))
+
+                    try:
+                        respect_gain = float(a.get("respect_gain") or 0)
+                    except Exception:
+                        respect_gain = 0.0
+
+                    try:
+                        respect_loss = float(a.get("respect_loss") or 0)
+                    except Exception:
+                        respect_loss = 0.0
+
+                    war_bucket_apply(
+                        _db_conn,
+                        war_start,
+                        attacker_id,
+                        bucket,
+                        ff,
+                        respect_gain,
+                        respect_loss,
+                    )
 
             if stop:
                 st.is_initialized = 1
@@ -393,13 +439,13 @@ async def scan_faction_attacks_progress(
                 st.backfill_to = None
                 break
 
-            # IMPORTANT: make pagination exclusive to avoid duplicating the boundary item
             next_to_excl = max(int(next_to) - 1, 0)
-
             st.backfill_to = int(next_to_excl)
             to_val = int(next_to_excl)
 
+    # ✅ Persist scan state (CRITICAL)
     war_global_save(_db_conn, st)
+
     return int(st.is_initialized), int(pages_scanned)
 
 
@@ -408,48 +454,192 @@ async def scan_faction_attacks_progress(
 # -------------------------------------------------------------------
 async def get_user_warstats(torn_user_id: int) -> Dict[str, Any]:
     """
-    Returns dict containing wins + ff sums/counts for current war_start.
-    Also triggers a small scan burst to keep progress moving.
+    Returns dict containing attack totals + FF averages for current war_start.
+    Triggers a small scan burst to keep progress moving.
     """
     if _db_conn is None:
         raise RuntimeError("DB connection not set in torn_api (set_db_conn not called).")
 
     war_start = await get_cached_ranked_war_start()
 
-    # kick scan a little to keep data fresh
+    # keep data fresh
     await scan_faction_attacks_progress(pages_head=1, pages_backfill=2)
 
-    agg = war_agg_get(_db_conn, war_start, int(torn_user_id))
-    ranked_wins = int(agg["ranked_wins"])
-    other_wins = int(agg["other_wins"])
+    ranked = war_bucket_get(_db_conn, war_start, int(torn_user_id), "ranked")
+    outside = war_bucket_get(_db_conn, war_start, int(torn_user_id), "outside")
 
-    ranked_ff_sum = float(agg["ranked_ff_sum"])
-    ranked_ff_count = int(agg["ranked_ff_count"])
+    ranked_hits = int(ranked.get("hits_total", 0))
+    outside_hits = int(outside.get("hits_total", 0))
+
+    ranked_ff_sum = float(ranked.get("ff_sum", 0.0))
+    ranked_ff_count = int(ranked.get("ff_count", 0))
     ranked_ff_avg = (ranked_ff_sum / ranked_ff_count) if ranked_ff_count > 0 else None
 
-    total_ff_sum = float(agg["total_ff_sum"])
-    total_ff_count = int(agg["total_ff_count"])
-    total_ff_avg = (total_ff_sum / total_ff_count) if total_ff_count > 0 else None
+    outside_ff_sum = float(outside.get("ff_sum", 0.0))
+    outside_ff_count = int(outside.get("ff_count", 0))
+    outside_ff_avg = (outside_ff_sum / outside_ff_count) if outside_ff_count > 0 else None
 
-    # "Other" FF avg = total - ranked
-    other_ff_sum = total_ff_sum - ranked_ff_sum
-    other_ff_count = total_ff_count - ranked_ff_count
-    other_ff_avg = (other_ff_sum / other_ff_count) if other_ff_count > 0 else None
+    total_ff_sum = ranked_ff_sum + outside_ff_sum
+    total_ff_count = ranked_ff_count + outside_ff_count
+    total_ff_avg = (total_ff_sum / total_ff_count) if total_ff_count > 0 else None
 
     st = war_global_get(_db_conn, war_start)
 
     return {
         "war_start": int(war_start),
-        "ranked_wins": ranked_wins,
-        "other_wins": other_wins,
+        # keep key names stable for commands (/warstats uses ranked_wins/other_wins currently)
+        "ranked_wins": ranked_hits,
+        "other_wins": outside_hits,
         "ranked_ff_avg": ranked_ff_avg,
-        "other_ff_avg": other_ff_avg,
+        "other_ff_avg": outside_ff_avg,
         "total_ff_avg": total_ff_avg,
         "is_initialized": int(st.is_initialized) if st else 0,
         "backfill_to": int(st.backfill_to) if (st and st.backfill_to is not None) else None,
     }
 
 
+async def get_user_war_outcomes(torn_user_id: int) -> Dict[str, Any]:
+    """
+    Returns { bucket: { outcome: count } } for a user for current war_start.
+    (Not required for /warstats_all; useful for debugging or future display.)
+    """
+    if _db_conn is None:
+        raise RuntimeError("DB connection not set in torn_api (set_db_conn not called).")
+
+    war_start = await get_cached_ranked_war_start()
+    await scan_faction_attacks_progress(pages_head=1, pages_backfill=2)
+
+    return {
+        "war_start": int(war_start),
+        "outcomes": war_outcome_get_user(_db_conn, war_start, int(torn_user_id)),
+    }
+
+
+async def get_all_warstats() -> Dict[str, Any]:
+    """
+    Leadership list: returns all aggregates for current war_start.
+    Also triggers a scan burst.
+    """
+    if _db_conn is None:
+        raise RuntimeError("DB connection not set in torn_api (set_db_conn not called).")
+
+    war_start = await get_cached_ranked_war_start()
+    await scan_faction_attacks_progress(pages_head=1, pages_backfill=3)
+
+    rows = war_bucket_list_all(_db_conn, war_start)
+    st = war_global_get(_db_conn, war_start)
+    name_map = await get_member_name_map()
+
+    # Combine ranked/outside per user
+    by_user: Dict[int, Dict[str, Any]] = {}
+
+    for r in rows:
+        tid = int(r.get("torn_id", 0))
+        if tid <= 0:
+            continue
+        bucket = str(r.get("bucket") or "")
+
+        if tid not in by_user:
+            by_user[tid] = {
+                "ranked_hits": 0,
+                "outside_hits": 0,
+                "ranked_ff_sum": 0.0,
+                "ranked_ff_count": 0,
+                "outside_ff_sum": 0.0,
+                "outside_ff_count": 0,
+            }
+
+        if bucket == "ranked":
+            by_user[tid]["ranked_hits"] = int(r.get("hits_total", 0))
+            by_user[tid]["ranked_ff_sum"] = float(r.get("ff_sum", 0.0))
+            by_user[tid]["ranked_ff_count"] = int(r.get("ff_count", 0))
+        else:
+            by_user[tid]["outside_hits"] = int(r.get("hits_total", 0))
+            by_user[tid]["outside_ff_sum"] = float(r.get("ff_sum", 0.0))
+            by_user[tid]["outside_ff_count"] = int(r.get("ff_count", 0))
+
+    out_rows: List[Dict[str, Any]] = []
+
+    for tid, data in by_user.items():
+        ranked_ff_avg = (
+            (data["ranked_ff_sum"] / data["ranked_ff_count"])
+            if data["ranked_ff_count"] > 0
+            else None
+        )
+        outside_ff_avg = (
+            (data["outside_ff_sum"] / data["outside_ff_count"])
+            if data["outside_ff_count"] > 0
+            else None
+        )
+
+        total_ff_sum = data["ranked_ff_sum"] + data["outside_ff_sum"]
+        total_ff_count = data["ranked_ff_count"] + data["outside_ff_count"]
+        total_ff_avg = (total_ff_sum / total_ff_count) if total_ff_count > 0 else None
+
+        out_rows.append(
+            {
+                "torn_id": tid,
+                "name": name_map.get(tid, f"[{tid}]"),
+                # keep key names stable for existing /warstats_all formatting
+                "ranked_wins": int(data["ranked_hits"]),
+                "other_wins": int(data["outside_hits"]),
+                "ranked_ff_avg": ranked_ff_avg,
+                "other_ff_avg": outside_ff_avg,
+                "total_ff_avg": total_ff_avg,
+            }
+        )
+
+    # Optional: sort by ranked hits desc, then outside hits desc
+    out_rows.sort(
+        key=lambda r: (
+            int(r.get("ranked_wins", 0)),
+            int(r.get("other_wins", 0)),
+        ),
+        reverse=True,
+    )
+
+    return {
+        "war_start": int(war_start),
+        "rows": out_rows,
+        "is_initialized": int(st.is_initialized) if st else 0,
+    }
+
+
+async def get_all_war_outcomes() -> Dict[str, Any]:
+    """
+    Returns per-user outcome counts for current war_start.
+    (Not required for /warstats_all; useful for debugging or future display.)
+    """
+    if _db_conn is None:
+        raise RuntimeError("DB connection not set in torn_api (set_db_conn not called).")
+
+    war_start = await get_cached_ranked_war_start()
+    await scan_faction_attacks_progress(pages_head=1, pages_backfill=3)
+
+    rows = war_outcome_list_all(_db_conn, war_start)
+    name_map = await get_member_name_map()
+
+    # reshape: tid -> bucket -> outcome -> count
+    out: Dict[int, Dict[str, Dict[str, int]]] = {}
+    for r in rows:
+        tid = int(r["torn_id"])
+        b = str(r["bucket"])
+        o = str(r["outcome"])
+        c = int(r["count"] or 0)
+        out.setdefault(tid, {}).setdefault(b, {})[o] = c
+
+    return {
+        "war_start": int(war_start),
+        "rows": [
+            {"torn_id": tid, "name": name_map.get(tid, f"[{tid}]"), "outcomes": buckets}
+            for tid, buckets in out.items()
+        ],
+    }
+
+
+# -------------------------------------------------------------------
+# Other endpoints used by the bot
+# -------------------------------------------------------------------
 async def fetch_faction_balance() -> dict:
     return await torn_get("/faction/balance")
 
@@ -497,7 +687,7 @@ def parse_active_chain(payload: dict) -> Optional[dict]:
 
     timeout = _safe_int(chain.get("timeout"), 0) or 0
 
-    out: Dict[str, Any] = {
+    out2: Dict[str, Any] = {
         "id": int(chain_id),
         "timeout": int(timeout),
     }
@@ -505,71 +695,19 @@ def parse_active_chain(payload: dict) -> Optional[dict]:
     for k in ("current", "max", "cooldown", "start", "end"):
         vi = _safe_int(chain.get(k))
         if vi is not None:
-            out[k] = int(vi)
+            out2[k] = int(vi)
 
     try:
         if chain.get("modifier") is not None:
-            out["modifier"] = float(chain.get("modifier"))
+            out2["modifier"] = float(chain.get("modifier"))
     except Exception:
         pass
 
-    return out
-
-
-async def get_all_warstats() -> Dict[str, Any]:
-    """
-    Leadership list: returns all aggregates for current war_start.
-    Also triggers a scan burst.
-    """
-    if _db_conn is None:
-        raise RuntimeError("DB connection not set in torn_api (set_db_conn not called).")
-
-    war_start = await get_cached_ranked_war_start()
-    await scan_faction_attacks_progress(pages_head=1, pages_backfill=3)
-
-    rows = war_agg_list_all(_db_conn, war_start)
-    st = war_global_get(_db_conn, war_start)
-
-    name_map = await get_member_name_map()
-
-    # decorate rows with name + averages
-    out_rows: List[Dict[str, Any]] = []
-    for r in rows:
-        ranked_ff_sum = float(r["ranked_ff_sum"])
-        ranked_ff_count = int(r["ranked_ff_count"])
-        ranked_ff_avg = (ranked_ff_sum / ranked_ff_count) if ranked_ff_count > 0 else None
-
-        total_ff_sum = float(r["total_ff_sum"])
-        total_ff_count = int(r["total_ff_count"])
-        total_ff_avg = (total_ff_sum / total_ff_count) if total_ff_count > 0 else None
-
-        other_ff_sum = total_ff_sum - ranked_ff_sum
-        other_ff_count = total_ff_count - ranked_ff_count
-        other_ff_avg = (other_ff_sum / other_ff_count) if other_ff_count > 0 else None
-
-        tid = int(r["torn_id"])
-        out_rows.append({
-            "torn_id": tid,
-            "name": name_map.get(tid, f"[{tid}]"),
-            "ranked_wins": int(r["ranked_wins"]),
-            "other_wins": int(r["other_wins"]),
-            "ranked_ff_avg": ranked_ff_avg,
-            "other_ff_avg": other_ff_avg,
-            "total_ff_avg": total_ff_avg,
-        })
-
-    return {
-        "war_start": int(war_start),
-        "rows": out_rows,
-        "is_initialized": int(st.is_initialized) if st else 0,
-    }
+    return out2
 
 
 # -------------------------------------------------------------------
 # Backwards-compatible aliases for older command modules
 # -------------------------------------------------------------------
-
-# Older commands still expect these names.
-# They now all map to the unified incremental scanner.
 scan_ranked_war_stats_for_user = scan_faction_attacks_progress
 scan_war_window_stats_for_user = scan_faction_attacks_progress
