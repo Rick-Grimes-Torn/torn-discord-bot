@@ -293,8 +293,6 @@ async def scan_faction_attacks_progress(
             attacks = page.get("attacks", [])
             if not isinstance(attacks, list) or not attacks:
                 break
-
-            stop = False
             for a in attacks:
                 if not isinstance(a, dict):
                     continue
@@ -318,8 +316,7 @@ async def scan_faction_attacks_progress(
 
                 # Stop at already-processed boundary
                 if (started < st.last_ts) or (started == st.last_ts and attack_id_i <= st.last_attack_id):
-                    stop = True
-                    break
+                    continue
 
                 if started < war_start:
                     continue
