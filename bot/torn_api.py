@@ -361,9 +361,6 @@ async def scan_faction_attacks_progress(
                         respect_loss,
                     )
 
-            if stop:
-                break
-
             prev_url = (((page.get("_metadata") or {}).get("links") or {}).get("prev"))
             to_next = extract_to_from_prev_url(prev_url)
             if to_next is None:
