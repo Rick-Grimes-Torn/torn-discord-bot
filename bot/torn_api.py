@@ -49,14 +49,14 @@ KNOWN_OUTCOMES = {
     "assist",
     "stalemate",
     "hospitalized",
-    "leave",
+    "special",
 }
 
 COUNTED_ATTACK_OUTCOMES = {
     "attacked",
     "mugged",
     "hospitalized",
-    "leave",
+    "special",
 }
 
 
@@ -244,15 +244,110 @@ async def get_member_name_map(ttl_seconds: int = 300) -> Dict[int, str]:
 # -------------------------------------------------------------------
 def _scan_params_for_state(st) -> Tuple[int, int]:
     if st is not None and int(getattr(st, "is_initialized", 0)) == 0:
-        return 2, 25
-    return 1, 2
+        return 10, 25
+    return 10, 2
+
+
+def _process_attack(
+    a: dict,
+    war_start: int,
+    cursor_ts: int,
+    cursor_id: int,
+    seen_attack_ids: set,
+    db_conn,
+) -> Tuple[bool, bool, int, int]:
+    """
+    Process a single attack dict.
+
+    Returns: (hit_cursor_boundary, counted, new_cursor_ts, new_cursor_id)
+
+    hit_cursor_boundary=True means we've reached attacks we've already processed —
+    the caller should stop fetching more pages in this direction.
+
+    CRITICAL ordering:
+      1. Check cursor boundary FIRST (before try_mark) so we don't permanently
+         mark an attack as processed when we're only skipping it due to the boundary.
+      2. Check per-invocation dedupe (seen_attack_ids) second.
+      3. Only then call war_processed_try_mark (persistent dedupe).
+    """
+    if not isinstance(a, dict):
+        return False, False, cursor_ts, cursor_id
+
+    started = a.get("started")
+    if not isinstance(started, int):
+        return False, False, cursor_ts, cursor_id
+
+    attack_id_i = _safe_int0(a.get("id"))
+    if attack_id_i <= 0:
+        return False, False, cursor_ts, cursor_id
+
+    # --- Step 1: Cursor boundary check BEFORE any marking ---
+    # If this attack is at or before our saved cursor, we've already processed
+    # everything up to and including this point. Signal the caller to stop.
+    if started < cursor_ts or (started == cursor_ts and attack_id_i <= cursor_id):
+        return True, False, cursor_ts, cursor_id
+
+    # --- Step 2: Must be within the war window ---
+    if started < war_start:
+        return True, False, cursor_ts, cursor_id  # past war start, stop scanning
+
+    # --- Step 3: Per-invocation dedupe (page boundary overlap) ---
+    if attack_id_i in seen_attack_ids:
+        return False, False, cursor_ts, cursor_id
+    seen_attack_ids.add(attack_id_i)
+
+    # --- Step 4: Persistent dedupe (across bot restarts / multiple callers) ---
+    if not war_processed_try_mark(db_conn, war_start, attack_id_i):
+        # Already counted in a previous scan run — update cursor and move on
+        new_ts = started if started > cursor_ts or (started == cursor_ts and attack_id_i > cursor_id) else cursor_ts
+        new_id = attack_id_i if started >= new_ts else cursor_id
+        return False, False, max(started, cursor_ts), attack_id_i if started == max(started, cursor_ts) else cursor_id
+
+    # --- Step 5: Count the attack ---
+    outcome = _norm_outcome(a.get("result"))
+
+    attacker = a.get("attacker") or {}
+    attacker_id = _safe_int0(attacker.get("id"))
+    if attacker_id <= 0:
+        return False, False, cursor_ts, cursor_id
+
+    is_ranked = bool(a.get("is_ranked_war", False))
+    bucket = "ranked" if is_ranked else "outside"
+
+    war_outcome_apply(db_conn, war_start, attacker_id, bucket, outcome)
+
+    if outcome in COUNTED_ATTACK_OUTCOMES:
+        modifiers = a.get("modifiers") or {}
+        ff = _safe_float(modifiers.get("fair_fight"))
+
+        try:
+            respect_gain = float(a.get("respect_gain") or 0)
+        except Exception:
+            respect_gain = 0.0
+
+        try:
+            respect_loss = float(a.get("respect_loss") or 0)
+        except Exception:
+            respect_loss = 0.0
+
+        war_bucket_apply(
+            db_conn,
+            war_start,
+            attacker_id,
+            bucket,
+            ff,
+            respect_gain,
+            respect_loss,
+        )
+
+    return False, True, cursor_ts, cursor_id
 
 
 # -------------------------------------------------------------------
 # Global scan engine (one scan updates everyone)
 # -------------------------------------------------------------------
 async def scan_faction_attacks_progress(
-    pages_head: int = 1,
+    pages_head: int = 10,
     pages_backfill: int = 3,
 ) -> Tuple[int, int]:
     """
@@ -263,7 +358,17 @@ async def scan_faction_attacks_progress(
       - global async lock prevents concurrent overlapping scans
       - per-scan seen_attack_ids prevents boundary duplicates within an invocation
       - persistent war_processed_attack prevents duplicates across runs/restarts
-      - cursor boundary (ts + id) prevents reprocessing newer window across runs
+      - cursor boundary check happens BEFORE try_mark so attacks are never lost
+
+    Head scan:
+      - Fetches newest pages until it hits the known cursor (already-processed boundary)
+      - pages_head caps the maximum pages per call to avoid runaway API usage
+      - This ensures ALL new attacks since the last scan are captured, not just 100
+
+    Backfill:
+      - Only runs while is_initialized == 0
+      - Works backwards from where the head scan ended
+      - Marks is_initialized = 1 when war_start boundary is reached
     """
     async with _scan_lock:
         if _db_conn is None:
@@ -276,15 +381,26 @@ async def scan_faction_attacks_progress(
             st = war_global_reset(_db_conn, war_start)
 
         pages_scanned = 0
-
         seen_attack_ids: set[int] = set()
+
+        # Snapshot the cursor at the start of this scan run.
+        # We use this fixed snapshot for boundary checks throughout the head scan
+        # so that cursor updates within this run don't affect our stop condition.
+        cursor_ts = int(st.last_ts)
+        cursor_id = int(st.last_attack_id)
+
+        # Track the highest (newest) attack seen this run for cursor advancement
+        new_cursor_ts = cursor_ts
+        new_cursor_id = cursor_id
 
         # -------------------------
         # HEAD SCAN (newest hits)
         # -------------------------
+        # Fetch pages newest-first until we hit attacks we've already processed.
+        # pages_head caps API calls per invocation; any remaining new attacks will
+        # be caught on the next command invocation.
         to_val: Optional[int] = None
-        new_cursor_ts = int(st.last_ts)
-        new_cursor_id = int(st.last_attack_id)
+        reached_cursor = False
 
         for _ in range(pages_head):
             page = await fetch_faction_attacks_outgoing(limit=100, to=to_val)
@@ -292,86 +408,42 @@ async def scan_faction_attacks_progress(
 
             attacks = page.get("attacks", [])
             if not isinstance(attacks, list) or not attacks:
+                reached_cursor = True
                 break
+
             for a in attacks:
-                if not isinstance(a, dict):
-                    continue
+                hit_boundary, _counted, _new_ts, _new_id = _process_attack(
+                    a, war_start, cursor_ts, cursor_id, seen_attack_ids, _db_conn
+                )
 
+                if hit_boundary:
+                    reached_cursor = True
+                    break
+
+                # Track newest attack for cursor advancement
                 started = a.get("started")
-                if not isinstance(started, int):
-                    continue
+                aid = _safe_int0(a.get("id"))
+                if isinstance(started, int) and aid > 0:
+                    if started > new_cursor_ts or (started == new_cursor_ts and aid > new_cursor_id):
+                        new_cursor_ts = started
+                        new_cursor_id = aid
 
-                attack_id_i = _safe_int0(a.get("id"))
-                if attack_id_i <= 0:
-                    continue
-
-                # per-invocation dedupe
-                if attack_id_i in seen_attack_ids:
-                    continue
-                seen_attack_ids.add(attack_id_i)
-
-                # persistent dedupe (across runs/restarts)
-                if not war_processed_try_mark(_db_conn, war_start, attack_id_i):
-                    continue
-
-                # Stop at already-processed boundary
-                if (started < st.last_ts) or (started == st.last_ts and attack_id_i <= st.last_attack_id):
-                    continue
-
-                if started < war_start:
-                    continue
-
-                # update cursor to newest seen
-                if (started > new_cursor_ts) or (started == new_cursor_ts and attack_id_i > new_cursor_id):
-                    new_cursor_ts, new_cursor_id = started, attack_id_i
-
-                outcome = _norm_outcome(a.get("result"))
-
-                attacker = a.get("attacker") or {}
-                attacker_id = _safe_int0(attacker.get("id"))
-                if attacker_id <= 0:
-                    continue
-
-                is_ranked = bool(a.get("is_ranked_war", False))
-                bucket = "ranked" if is_ranked else "outside"
-
-                war_outcome_apply(_db_conn, war_start, attacker_id, bucket, outcome)
-
-                if outcome in COUNTED_ATTACK_OUTCOMES:
-                    modifiers = a.get("modifiers") or {}
-                    ff = _safe_float(modifiers.get("fair_fight"))
-
-                    try:
-                        respect_gain = float(a.get("respect_gain") or 0)
-                    except Exception:
-                        respect_gain = 0.0
-
-                    try:
-                        respect_loss = float(a.get("respect_loss") or 0)
-                    except Exception:
-                        respect_loss = 0.0
-
-                    war_bucket_apply(
-                        _db_conn,
-                        war_start,
-                        attacker_id,
-                        bucket,
-                        ff,
-                        respect_gain,
-                        respect_loss,
-                    )
+            if reached_cursor:
+                break
 
             prev_url = (((page.get("_metadata") or {}).get("links") or {}).get("prev"))
             to_next = extract_to_from_prev_url(prev_url)
             if to_next is None:
+                reached_cursor = True
                 break
 
             to_val = int(to_next)
 
+        # Advance the cursor to the newest attack we saw
         st.last_ts = int(new_cursor_ts)
         st.last_attack_id = int(new_cursor_id)
 
-        # Initialize backfill cursor once
+        # Initialize backfill cursor once (points to the oldest page the head scan reached)
         if st.is_initialized == 0 and st.backfill_to is None:
             st.backfill_to = int(to_val) if to_val is not None else None
 
@@ -400,6 +472,7 @@ async def scan_faction_attacks_progress(
                     if not isinstance(started, int):
                         continue
 
+                    # Past the war window — backfill complete
                     if started < war_start:
                         stop = True
                         break
@@ -408,12 +481,12 @@ async def scan_faction_attacks_progress(
                     if attack_id_i <= 0:
                         continue
 
-                    # per-invocation dedupe
+                    # Per-invocation dedupe
                     if attack_id_i in seen_attack_ids:
                         continue
                     seen_attack_ids.add(attack_id_i)
 
-                    # persistent dedupe (across runs/restarts)
+                    # Persistent dedupe
                     if not war_processed_try_mark(_db_conn, war_start, attack_id_i):
                         continue
 
